@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import os
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Text
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Text, Float
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
+from dotenv import load_dotenv
+
+load_dotenv()
 
 Base = declarative_base()
 
@@ -21,7 +24,16 @@ class AudioFile(Base):
     file_path = Column(String, unique=True)
     canonical_name = Column(String)
     instrument_category = Column(String, nullable=True)
+    features = relationship("AudioFeature", back_populates="audio_file")
     tracks = relationship("MidiTrack", back_populates="audio_file")
+
+class AudioFeature(Base):
+    __tablename__ = "audio_features"
+    id = Column(Integer, primary_key=True)
+    audio_file_id = Column(Integer, ForeignKey("audio_files.id"))
+    feature_type = Column(String)  # e.g., "mel_spectrogram"
+    feature_data = Column(Text)    # JSON string representing the feature array
+    audio_file = relationship("AudioFile", back_populates="features")
 
 class MidiTrack(Base):
     __tablename__ = "midi_tracks"
@@ -33,10 +45,47 @@ class MidiTrack(Base):
     assigned_audio_file_id = Column(Integer, ForeignKey("audio_files.id"), nullable=True)
     midi_file = relationship("MidiFile", back_populates="tracks")
     audio_file = relationship("AudioFile", back_populates="tracks")
+    notes = relationship("MidiNote", back_populates="midi_track")
+    cc_events = relationship("MidiCC", back_populates="midi_track")
+    program_changes = relationship("MidiProgramChange", back_populates="midi_track")
 
-# Define your database URL (here we use SQLite).
-DATABASE_URL = "sqlite:///preprocessed_data.db"
+class MidiNote(Base):
+    __tablename__ = "midi_notes"
+    id = Column(Integer, primary_key=True)
+    midi_track_id = Column(Integer, ForeignKey("midi_tracks.id"))
+    channel = Column(Integer)
+    note = Column(Integer)  # MIDI note number
+    velocity = Column(Integer)
+    start_tick = Column(Integer)
+    end_tick = Column(Integer)
+    start_time = Column(Float)  # seconds
+    duration = Column(Float)    # seconds
+    midi_track = relationship("MidiTrack", back_populates="notes")
 
+class MidiCC(Base):
+    __tablename__ = "midi_cc"
+    id = Column(Integer, primary_key=True)
+    midi_track_id = Column(Integer, ForeignKey("midi_tracks.id"))
+    channel = Column(Integer)
+    cc_number = Column(Integer)
+    cc_value = Column(Integer)
+    tick = Column(Integer)
+    time = Column(Float)  # seconds
+    midi_track = relationship("MidiTrack", back_populates="cc_events")
+
+class MidiProgramChange(Base):
+    __tablename__ = "midi_program_changes"
+    id = Column(Integer, primary_key=True)
+    midi_track_id = Column(Integer, ForeignKey("midi_tracks.id"))
+    channel = Column(Integer)
+    program = Column(Integer)
+    tick = Column(Integer)
+    time = Column(Float)  # seconds
+    midi_track = relationship("MidiTrack", back_populates="program_changes")
+
+# --- Database Configuration ---
+# Use the DATABASE_URL environment variable for PostgreSQL.
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/dbname")
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 session = Session()
@@ -45,6 +94,10 @@ def init_db():
     Base.metadata.create_all(engine)
 
 def insert_midi_file(file_path, tempo_map, time_signature_map, ticks_per_beat):
+    # Check for an existing record to avoid duplicates.
+    existing = session.query(MidiFile).filter_by(file_path=file_path).first()
+    if existing:
+        return existing
     record = MidiFile(
         file_path=file_path,
         tempo_map=tempo_map,
@@ -65,6 +118,16 @@ def insert_audio_file(file_path, canonical_name, instrument_category):
     session.commit()
     return record
 
+def insert_audio_feature(audio_file_id, feature_type, feature_data):
+    record = AudioFeature(
+        audio_file_id=audio_file_id,
+        feature_type=feature_type,
+        feature_data=feature_data
+    )
+    session.add(record)
+    session.commit()
+    return record
+
 def insert_midi_track(midi_file_id, track_index, track_name, instrument_category, assigned_audio_file_id):
     record = MidiTrack(
         midi_file_id=midi_file_id,
@@ -72,6 +135,46 @@ def insert_midi_track(midi_file_id, track_index, track_name, instrument_category
         track_name=track_name,
         instrument_category=instrument_category,
         assigned_audio_file_id=assigned_audio_file_id
+    )
+    session.add(record)
+    session.commit()
+    return record
+
+def insert_midi_note(midi_track_id, channel, note, velocity, start_tick, end_tick, start_time, duration):
+    record = MidiNote(
+        midi_track_id=midi_track_id,
+        channel=channel,
+        note=note,
+        velocity=velocity,
+        start_tick=start_tick,
+        end_tick=end_tick,
+        start_time=start_time,
+        duration=duration
+    )
+    session.add(record)
+    session.commit()
+    return record
+
+def insert_midi_cc(midi_track_id, channel, cc_number, cc_value, tick, time):
+    record = MidiCC(
+        midi_track_id=midi_track_id,
+        channel=channel,
+        cc_number=cc_number,
+        cc_value=cc_value,
+        tick=tick,
+        time=time
+    )
+    session.add(record)
+    session.commit()
+    return record
+
+def insert_midi_program_change(midi_track_id, channel, program, tick, time):
+    record = MidiProgramChange(
+        midi_track_id=midi_track_id,
+        channel=channel,
+        program=program,
+        tick=tick,
+        time=time
     )
     session.add(record)
     session.commit()
