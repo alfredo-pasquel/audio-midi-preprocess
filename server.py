@@ -8,6 +8,17 @@ load_dotenv()
 
 Base = declarative_base()
 
+# --- New Project Model ---
+class Project(Base):
+    __tablename__ = "projects"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=True)  # Optional: you can store a project name here.
+    # Relationships to top-level file models:
+    midi_files = relationship("MidiFile", back_populates="project")
+    audio_files = relationship("AudioFile", back_populates="project")
+    final_mixes = relationship("FinalMix", back_populates="project")
+
+
 class MidiFile(Base):
     __tablename__ = "midi_files"
     id = Column(Integer, primary_key=True)
@@ -15,9 +26,13 @@ class MidiFile(Base):
     tempo_map = Column(Text)           # stored as JSON
     time_signature_map = Column(Text)    # stored as JSON
     ticks_per_beat = Column(Integer)
+    # New column and relationship to Project:
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    project = relationship("Project", back_populates="midi_files")
     tracks = relationship("MidiTrack", back_populates="midi_file")
-    # Add a one-to-one relationship with the final mix.
+    # One-to-one relationship with the final mix.
     final_mix = relationship("FinalMix", back_populates="midi_file", uselist=False)
+
 
 class AudioFile(Base):
     __tablename__ = "audio_files"
@@ -25,8 +40,12 @@ class AudioFile(Base):
     file_path = Column(String, unique=True)
     canonical_name = Column(String)
     instrument_category = Column(String, nullable=True)
+    # New column and relationship to Project:
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    project = relationship("Project", back_populates="audio_files")
     features = relationship("AudioFeature", back_populates="audio_file")
     tracks = relationship("MidiTrack", back_populates="audio_file")
+
 
 class AudioFeature(Base):
     __tablename__ = "audio_features"
@@ -36,6 +55,7 @@ class AudioFeature(Base):
     feature_data = Column(Text)    # JSON string representing the feature array
     audio_file = relationship("AudioFile", back_populates="features")
 
+
 class FinalMix(Base):
     __tablename__ = "final_mixes"
     id = Column(Integer, primary_key=True)
@@ -43,7 +63,11 @@ class FinalMix(Base):
     file_path = Column(String, unique=True)
     feature_type = Column(String)  # e.g., "mel_spectrogram"
     feature_data = Column(Text)    # JSON string representing the feature array
+    # New column and relationship to Project:
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    project = relationship("Project", back_populates="final_mixes")
     midi_file = relationship("MidiFile", back_populates="final_mix")
+
 
 class MidiTrack(Base):
     __tablename__ = "midi_tracks"
@@ -59,6 +83,7 @@ class MidiTrack(Base):
     cc_events = relationship("MidiCC", back_populates="midi_track")
     program_changes = relationship("MidiProgramChange", back_populates="midi_track")
 
+
 class MidiNote(Base):
     __tablename__ = "midi_notes"
     id = Column(Integer, primary_key=True)
@@ -72,6 +97,7 @@ class MidiNote(Base):
     duration = Column(Float)    # seconds
     midi_track = relationship("MidiTrack", back_populates="notes")
 
+
 class MidiCC(Base):
     __tablename__ = "midi_cc"
     id = Column(Integer, primary_key=True)
@@ -83,6 +109,7 @@ class MidiCC(Base):
     time = Column(Float)  # seconds
     midi_track = relationship("MidiTrack", back_populates="cc_events")
 
+
 class MidiProgramChange(Base):
     __tablename__ = "midi_program_changes"
     id = Column(Integer, primary_key=True)
@@ -93,6 +120,7 @@ class MidiProgramChange(Base):
     time = Column(Float)  # seconds
     midi_track = relationship("MidiTrack", back_populates="program_changes")
 
+
 # --- Database Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL")  # Now read from the .env file.
 engine = create_engine(DATABASE_URL)
@@ -102,22 +130,24 @@ session = Session()
 def init_db():
     Base.metadata.create_all(engine)
 
-def insert_midi_file(file_path, tempo_map, time_signature_map, ticks_per_beat):
+def insert_midi_file(file_path, tempo_map, time_signature_map, ticks_per_beat, project_id=None):
     record = MidiFile(
         file_path=file_path,
         tempo_map=tempo_map,
         time_signature_map=time_signature_map,
-        ticks_per_beat=ticks_per_beat
+        ticks_per_beat=ticks_per_beat,
+        project_id=project_id
     )
     session.add(record)
     session.commit()
     return record
 
-def insert_audio_file(file_path, canonical_name, instrument_category):
+def insert_audio_file(file_path, canonical_name, instrument_category, project_id=None):
     record = AudioFile(
         file_path=file_path,
         canonical_name=canonical_name,
-        instrument_category=instrument_category
+        instrument_category=instrument_category,
+        project_id=project_id
     )
     session.add(record)
     session.commit()
@@ -133,12 +163,13 @@ def insert_audio_feature(audio_file_id, feature_type, feature_data):
     session.commit()
     return record
 
-def insert_final_mix(midi_file_id, file_path, feature_type, feature_data):
+def insert_final_mix(midi_file_id, file_path, feature_type, feature_data, project_id=None):
     record = FinalMix(
         midi_file_id=midi_file_id,
         file_path=file_path,
         feature_type=feature_type,
-        feature_data=feature_data
+        feature_data=feature_data,
+        project_id=project_id
     )
     session.add(record)
     session.commit()
