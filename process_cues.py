@@ -346,7 +346,7 @@ def process_cue(cue_dir, sample_rate):
             feature_data=json.dumps(final_mix_features)
         )
     else:
-        print("No final mix file (containing '6mx') found in", pt_dir)
+        print("No final mix file (containing '6MX') found in", pt_dir)
 
     # --- Process individual instrument audio groups ---
     audio_file_records = {}
