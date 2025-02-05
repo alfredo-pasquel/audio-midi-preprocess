@@ -85,7 +85,7 @@ The following tables are defined:
 1. **Clone the Repository:**
 
    ```bash
-   git clone https://github.com/yourusername/your-repo-name.git
+   git clone https://github.com/alfredo-pasquel/audio-midi-preprocess.git
    cd your-repo-name
    ```
 
@@ -146,4 +146,4 @@ This project is released under the [MIT License](LICENSE).
 
 ## Contact
 
-For questions, issues, or contributions, please open an issue on GitHub or contact the maintainer at [your.email@example.com](mailto:your.email@example.com).
+For questions, issues, or contributions, please open an issue on GitHub or contact the maintainer at [info@alfredopasquel.com](mailto:info@alfredopasquel.com).
