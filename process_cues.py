@@ -54,11 +54,9 @@ def find_cue_directories(base_dir):
     """
     cue_dirs = []
     for root, dirs, files in os.walk(base_dir):
-        # Check for required subdirectories.
         midi_dir = os.path.join(root, "MIDI")
         pt_audio_dir = os.path.join(root, "PT", "Audio Files")
         if os.path.isdir(midi_dir) and os.path.isdir(pt_audio_dir):
-            # Check if there's at least one .mid file in the MIDI folder.
             mid_files = glob.glob(os.path.join(midi_dir, "*.mid"))
             if mid_files:
                 cue_dirs.append(root)
@@ -71,6 +69,7 @@ from server import (
     insert_midi_file,
     insert_audio_file,
     insert_audio_feature,
+    insert_final_mix,
     insert_midi_track,
     insert_midi_note,
     insert_midi_cc,
@@ -92,7 +91,8 @@ def get_audio_file_groups(audio_dir):
     for ext in audio_extensions:
         found_files.extend(glob.glob(os.path.join(audio_dir, ext)))
     groups = {}
-    channel_suffixes = [".L", ".C", ".R", ".Ls", ".Rs", ".lfe"]
+    # Updated list of channel suffixes to include additional variants.
+    channel_suffixes = [".L", ".C", ".R", ".Ls", ".Rs", ".lfe", ".Lf", ".Rf"]
     for filepath in found_files:
         base = os.path.basename(filepath)
         name, _ = os.path.splitext(base)
@@ -120,7 +120,7 @@ def combine_audio_group(file_list, sample_rate):
     composite = np.mean(np.vstack(signals), axis=0)
     return composite
 
-def extract_audio_features_from_composite(y, sr=44100, n_mels=64, hop_length=512):
+def extract_audio_features_from_composite(y, sr=48000, n_mels=64, hop_length=512):
     """
     Compute a mel-spectrogram (in dB) from a composite waveform y at reduced resolution.
     Returns the mel-spectrogram as a list.
@@ -235,7 +235,8 @@ def match_track_to_audio(track_name, canonical_names):
             temperature=0.0,
         )
         answer = response.choices[0].message.content.strip()
-        if answer not in canonical_names:
+        # Use case-insensitive comparison:
+        if answer.lower() not in [name.lower() for name in canonical_names]:
             best_match, score = process.extractOne(answer, canonical_names)
             if score >= 80:
                 return best_match
@@ -313,6 +314,11 @@ def process_cue(cue_dir, sample_rate):
         audio_features[canonical] = features
 
     canonical_names = list(audio_groups.keys())
+    # Debug: print canonical names
+    print("Canonical Audio Groups:")
+    for name in canonical_names:
+        print("  ", name)
+
     mapping = {}
     for idx, track_name in midi_tracks:
         best_match = match_track_to_audio(track_name, canonical_names)
@@ -331,14 +337,20 @@ def process_cue(cue_dir, sample_rate):
     )
 
     # --- Process and insert final mix file ---
-    # Look for a final mix file in pt_dir that has "6mx" in its name (case-insensitive).
-    final_mix_files = glob.glob(os.path.join(pt_dir, "*6mx*"))
+    # Look for a final mix file in pt_dir that has "6mx" (case-insensitive) in its canonical name.
+    final_mix_files = []
+    for f in glob.glob(os.path.join(pt_dir, "*")):
+        if os.path.isfile(f):
+            # Use case-insensitive check on the filename (without extension)
+            base = os.path.basename(f)
+            name, _ = os.path.splitext(base)
+            if "6mx" in name.lower():
+                final_mix_files.append(f)
     if final_mix_files:
         final_mix_file = final_mix_files[0]  # assume one final mix per cue
         print("Processing Final Mix file:", final_mix_file)
         y_final, sr_final = librosa.load(final_mix_file, sr=sample_rate, mono=True)
         final_mix_features = extract_audio_features_from_composite(y_final, sr=int(sample_rate))
-        from server import insert_final_mix  # our new function from server.py
         insert_final_mix(
             midi_file_id=midi_file_record.id,
             file_path=final_mix_file,
@@ -366,7 +378,6 @@ def process_cue(cue_dir, sample_rate):
                 feature_type="mel_spectrogram",
                 feature_data=json.dumps(audio_features[canonical])
             )
-
     midi_track_ids = {}
     for idx, track_name in midi_tracks:
         midi_cat = assign_instrument_category(track_name, INSTRUMENT_CATEGORIES)
@@ -451,10 +462,10 @@ def main():
     
     cue_base_dir = sys.argv[1]
     try:
-        sample_rate = float(sys.argv[2]) if len(sys.argv) >= 3 else 44100
+        sample_rate = float(sys.argv[2]) if len(sys.argv) >= 3 else 48000
     except ValueError:
-        print("Invalid sample rate provided. Using default 44100 Hz.")
-        sample_rate = 44100
+        print("Invalid sample rate provided. Using default 48000 Hz.")
+        sample_rate = 48000
 
     cue_dirs = find_cue_directories(cue_base_dir)
     if not cue_dirs:
@@ -468,4 +479,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
