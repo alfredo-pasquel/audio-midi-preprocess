@@ -1,11 +1,6 @@
-#!/usr/bin/env python3
-import os
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Text, Float
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
-from dotenv import load_dotenv
-
-load_dotenv()
 
 Base = declarative_base()
 
@@ -17,6 +12,8 @@ class MidiFile(Base):
     time_signature_map = Column(Text)    # stored as JSON
     ticks_per_beat = Column(Integer)
     tracks = relationship("MidiTrack", back_populates="midi_file")
+    # Add a one-to-one relationship with the final mix.
+    final_mix = relationship("FinalMix", back_populates="midi_file", uselist=False)
 
 class AudioFile(Base):
     __tablename__ = "audio_files"
@@ -34,6 +31,15 @@ class AudioFeature(Base):
     feature_type = Column(String)  # e.g., "mel_spectrogram"
     feature_data = Column(Text)    # JSON string representing the feature array
     audio_file = relationship("AudioFile", back_populates="features")
+
+class FinalMix(Base):
+    __tablename__ = "final_mixes"
+    id = Column(Integer, primary_key=True)
+    midi_file_id = Column(Integer, ForeignKey("midi_files.id"), unique=True)
+    file_path = Column(String, unique=True)
+    feature_type = Column(String)  # e.g., "mel_spectrogram"
+    feature_data = Column(Text)    # JSON string representing the feature array
+    midi_file = relationship("MidiFile", back_populates="final_mix")
 
 class MidiTrack(Base):
     __tablename__ = "midi_tracks"
@@ -84,8 +90,7 @@ class MidiProgramChange(Base):
     midi_track = relationship("MidiTrack", back_populates="program_changes")
 
 # --- Database Configuration ---
-# Use the DATABASE_URL environment variable for PostgreSQL.
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/dbname")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Now read from the .env file.
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 session = Session()
@@ -94,10 +99,6 @@ def init_db():
     Base.metadata.create_all(engine)
 
 def insert_midi_file(file_path, tempo_map, time_signature_map, ticks_per_beat):
-    # Check for an existing record to avoid duplicates.
-    existing = session.query(MidiFile).filter_by(file_path=file_path).first()
-    if existing:
-        return existing
     record = MidiFile(
         file_path=file_path,
         tempo_map=tempo_map,
@@ -121,6 +122,17 @@ def insert_audio_file(file_path, canonical_name, instrument_category):
 def insert_audio_feature(audio_file_id, feature_type, feature_data):
     record = AudioFeature(
         audio_file_id=audio_file_id,
+        feature_type=feature_type,
+        feature_data=feature_data
+    )
+    session.add(record)
+    session.commit()
+    return record
+
+def insert_final_mix(midi_file_id, file_path, feature_type, feature_data):
+    record = FinalMix(
+        midi_file_id=midi_file_id,
+        file_path=file_path,
         feature_type=feature_type,
         feature_data=feature_data
     )
