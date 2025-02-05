@@ -6,6 +6,8 @@ This script recursively scans a base cues directory for projects (each cue folde
 must contain a "MIDI" subfolder with a .mid file and a "PT/Audio Files" subfolder).
 It then processes the MIDI and audio files, extracts features, maps MIDI tracks to audio
 groups using OpenAI, and inserts the data into a database.
+
+Duplicate-checking is performed based on file_path so that cues already catalogued are skipped.
 """
 
 import os
@@ -63,7 +65,7 @@ def find_cue_directories(base_dir):
     return cue_dirs
 
 # --- Database Functions ---
-# (These functions are assumed to be defined in server.py.)
+# These functions (and the session & models) are assumed to be defined in server.py.
 from server import (
     init_db,
     insert_midi_file,
@@ -73,7 +75,10 @@ from server import (
     insert_midi_track,
     insert_midi_note,
     insert_midi_cc,
-    insert_midi_program_change
+    insert_midi_program_change,
+    session,  # SQLAlchemy session object
+    MidiFile,  # Database model for MIDI files
+    AudioFile  # Database model for Audio files
 )
 
 # Initialize the database.
@@ -235,7 +240,7 @@ def match_track_to_audio(track_name, canonical_names):
             temperature=0.0,
         )
         answer = response.choices[0].message.content.strip()
-        # Use case-insensitive comparison:
+        # Case-insensitive matching:
         if answer.lower() not in [name.lower() for name in canonical_names]:
             best_match, score = process.extractOne(answer, canonical_names)
             if score >= 80:
@@ -288,6 +293,13 @@ def process_cue(cue_dir, sample_rate):
         return
     midi_file = mid_files[0]
     print("Processing MIDI file:", midi_file)
+    
+    # Duplicate-check: Skip cue if MIDI file already exists in the database.
+    from server import MidiFile  # Ensure MidiFile model is imported
+    existing_midi = session.query(MidiFile).filter_by(file_path=midi_file).first()
+    if existing_midi:
+        print(f"MIDI file {midi_file} is already processed. Skipping cue.")
+        return
 
     # Process MIDI data.
     tempo_map, time_signature_map, ticks_per_beat = extract_tempo_and_time_signature(midi_file)
@@ -314,7 +326,6 @@ def process_cue(cue_dir, sample_rate):
         audio_features[canonical] = features
 
     canonical_names = list(audio_groups.keys())
-    # Debug: print canonical names
     print("Canonical Audio Groups:")
     for name in canonical_names:
         print("  ", name)
@@ -337,17 +348,15 @@ def process_cue(cue_dir, sample_rate):
     )
 
     # --- Process and insert final mix file ---
-    # Look for a final mix file in pt_dir that has "6mx" (case-insensitive) in its canonical name.
     final_mix_files = []
     for f in glob.glob(os.path.join(pt_dir, "*")):
         if os.path.isfile(f):
-            # Use case-insensitive check on the filename (without extension)
             base = os.path.basename(f)
             name, _ = os.path.splitext(base)
             if "6mx" in name.lower():
                 final_mix_files.append(f)
     if final_mix_files:
-        final_mix_file = final_mix_files[0]  # assume one final mix per cue
+        final_mix_file = final_mix_files[0]
         print("Processing Final Mix file:", final_mix_file)
         y_final, sr_final = librosa.load(final_mix_file, sr=sample_rate, mono=True)
         final_mix_features = extract_audio_features_from_composite(y_final, sr=int(sample_rate))
@@ -362,15 +371,23 @@ def process_cue(cue_dir, sample_rate):
 
     # --- Process individual instrument audio groups ---
     audio_file_records = {}
-    for canonical in canonical_names:
+    for canonical in tqdm(canonical_names, desc="Processing Instrument Audio Groups", leave=False):
         rep_file = audio_groups[canonical][0]
         full_path = os.path.join(pt_dir, os.path.basename(rep_file))
         audio_cat = assign_instrument_category(canonical, INSTRUMENT_CATEGORIES)
-        rec = insert_audio_file(
-            file_path=full_path,
-            canonical_name=canonical,
-            instrument_category=audio_cat
-        )
+        
+        # Duplicate-check for audio files:
+        existing_audio = session.query(AudioFile).filter_by(file_path=full_path).first()
+        if existing_audio:
+            print(f"Audio file {full_path} already exists in the database. Skipping insertion.")
+            rec = existing_audio
+        else:
+            rec = insert_audio_file(
+                file_path=full_path,
+                canonical_name=canonical,
+                instrument_category=audio_cat
+            )
+        
         audio_file_records[canonical] = rec.id
         if canonical in audio_features:
             insert_audio_feature(
@@ -379,7 +396,7 @@ def process_cue(cue_dir, sample_rate):
                 feature_data=json.dumps(audio_features[canonical])
             )
     midi_track_ids = {}
-    for idx, track_name in midi_tracks:
+    for idx, track_name in tqdm(midi_tracks, desc="Inserting MIDI Tracks", leave=False):
         midi_cat = assign_instrument_category(track_name, INSTRUMENT_CATEGORIES)
         assigned_audio_id = None
         if mapping.get(track_name):

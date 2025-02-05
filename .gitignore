@@ -1,5 +1,20 @@
-.env
-__pycache__
 venv
+
+# Python bytecode files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# SQLite database files
+*.sqlite
+*.sqlite3
+
+# Environment variables
+.env
+
+# IDE directories and files
+.vscode/
+.idea/
+
+# OS-specific files
 .DS_Store
-preprocessed_data.db
