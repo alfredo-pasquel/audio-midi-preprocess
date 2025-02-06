@@ -76,13 +76,23 @@ from server import (
     insert_midi_note,
     insert_midi_cc,
     insert_midi_program_change,
+    get_cue_group_by_path,
+    insert_cue_group,
     session,  # SQLAlchemy session object
-    MidiFile,  # Database model for MIDI files
-    AudioFile  # Database model for Audio files
+    MidiFile,   # Database model for MIDI files
+    AudioFile   # Database model for Audio files
 )
 
 # Initialize the database.
 init_db()
+
+def get_or_create_cue_group(cue_path):
+    """Retrieve an existing CueGroup by cue_path or create a new one."""
+    from server import CueGroup  # Import here to avoid circular import issues.
+    cue_group = get_cue_group_by_path(cue_path)
+    if cue_group is None:
+        cue_group = insert_cue_group(cue_path)
+    return cue_group.id
 
 # --- Audio File Grouping and Combination Functions ---
 
@@ -111,28 +121,47 @@ def get_audio_file_groups(audio_dir):
 
 def combine_audio_group(file_list, sample_rate):
     """
-    Load each file in file_list (assumed mono), trim to the shortest length,
-    and average to create a composite waveform.
+    Load each file in file_list. If only one file is present, load it with all its channels
+    (interleaved mode). Otherwise, assume each file is a mono recording representing one channel,
+    trim to the shortest length, and stack them to create a multi-channel composite.
+    Returns an array with shape (channels, samples).
     """
-    signals = []
-    for f in file_list:
-        y, sr = librosa.load(f, sr=sample_rate, mono=True)
-        signals.append(y)
-    if not signals:
-        return None
-    min_len = min(len(y) for y in signals)
-    signals = [y[:min_len] for y in signals]
-    composite = np.mean(np.vstack(signals), axis=0)
-    return composite
+    if len(file_list) == 1:
+        y, sr = librosa.load(file_list[0], sr=sample_rate, mono=False)
+        if y.ndim == 1:
+            y = np.expand_dims(y, axis=0)
+        return y
+    else:
+        signals = []
+        for f in file_list:
+            y, sr = librosa.load(f, sr=sample_rate, mono=True)
+            signals.append(y)
+        if not signals:
+            return None
+        min_len = min(len(y) for y in signals)
+        signals = [y[:min_len] for y in signals]
+        composite = np.stack(signals, axis=0)
+        return composite
 
 def extract_audio_features_from_composite(y, sr=48000, n_mels=64, hop_length=512):
     """
-    Compute a mel-spectrogram (in dB) from a composite waveform y at reduced resolution.
-    Returns the mel-spectrogram as a list.
+    Compute a mel-spectrogram (in dB) from a composite waveform y.
+    If y is mono (1D), compute a single spectrogram.
+    If y is multi-channel (2D: channels x samples), compute a spectrogram for each channel
+    and return a nested list with shape (n_mels, time_steps, channels).
     """
-    mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, hop_length=hop_length)
-    mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-    return mel_spec_db.tolist()
+    if y.ndim == 1:
+        mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, hop_length=hop_length)
+        mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+        return mel_spec_db.tolist()
+    else:
+        mel_specs = []
+        for ch in range(y.shape[0]):
+            mel_spec = librosa.feature.melspectrogram(y=y[ch], sr=sr, n_mels=n_mels, hop_length=hop_length)
+            mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
+            mel_specs.append(mel_spec_db)
+        mel_specs = np.stack(mel_specs, axis=-1)
+        return mel_specs.tolist()
 
 # --- MIDI Processing Functions ---
 
@@ -240,7 +269,6 @@ def match_track_to_audio(track_name, canonical_names):
             temperature=0.0,
         )
         answer = response.choices[0].message.content.strip()
-        # Case-insensitive matching:
         if answer.lower() not in [name.lower() for name in canonical_names]:
             best_match, score = process.extractOne(answer, canonical_names)
             if score >= 80:
@@ -301,6 +329,9 @@ def process_cue(cue_dir, sample_rate):
         print(f"MIDI file {midi_file} is already processed. Skipping cue.")
         return
 
+    # Get or create the cue group record for this cue.
+    cue_group_id = get_or_create_cue_group(cue_dir)
+
     # Process MIDI data.
     tempo_map, time_signature_map, ticks_per_beat = extract_tempo_and_time_signature(midi_file)
     ts_events = sorted([(ts_tick, num, den) for (_, ts_tick, num, den) in time_signature_map], key=lambda x: x[0])
@@ -358,13 +389,15 @@ def process_cue(cue_dir, sample_rate):
     if final_mix_files:
         final_mix_file = final_mix_files[0]
         print("Processing Final Mix file:", final_mix_file)
+        # For the final mix, we load with mono=True (adjust if you need multi-channel)
         y_final, sr_final = librosa.load(final_mix_file, sr=sample_rate, mono=True)
         final_mix_features = extract_audio_features_from_composite(y_final, sr=int(sample_rate))
         insert_final_mix(
             midi_file_id=midi_file_record.id,
             file_path=final_mix_file,
             feature_type="mel_spectrogram",
-            feature_data=json.dumps(final_mix_features)
+            feature_data=json.dumps(final_mix_features),
+            cue_group_id=cue_group_id
         )
     else:
         print("No final mix file (containing '6MX') found in", pt_dir)
@@ -375,7 +408,6 @@ def process_cue(cue_dir, sample_rate):
         rep_file = audio_groups[canonical][0]
         full_path = os.path.join(pt_dir, os.path.basename(rep_file))
         audio_cat = assign_instrument_category(canonical, INSTRUMENT_CATEGORIES)
-        
         # Duplicate-check for audio files:
         existing_audio = session.query(AudioFile).filter_by(file_path=full_path).first()
         if existing_audio:
@@ -385,9 +417,9 @@ def process_cue(cue_dir, sample_rate):
             rec = insert_audio_file(
                 file_path=full_path,
                 canonical_name=canonical,
-                instrument_category=audio_cat
+                instrument_category=audio_cat,
+                cue_group_id=cue_group_id
             )
-        
         audio_file_records[canonical] = rec.id
         if canonical in audio_features:
             insert_audio_feature(
