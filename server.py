@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+"""
+server.py
+
+This module defines the database schema and helper functions for inserting and retrieving
+data from the database. SQLAlchemy is used as the ORM. Environment variables (via python‑dotenv)
+are used to supply the DATABASE_URL.
+"""
+
 import os
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Text, Float, LargeBinary
 from sqlalchemy.orm import sessionmaker, relationship
@@ -14,6 +22,7 @@ class CueGroup(Base):
     __tablename__ = "cue_groups"
     id = Column(Integer, primary_key=True)
     cue_path = Column(String, unique=True)
+    # Relationships:
     audio_files = relationship("AudioFile", back_populates="cue_group")
     final_mixes = relationship("FinalMix", back_populates="cue_group")
     midi_files = relationship("MidiFile", back_populates="cue_group")
@@ -32,11 +41,12 @@ class MidiFile(Base):
     __tablename__ = "midi_files"
     id = Column(Integer, primary_key=True)
     file_path = Column(String, unique=True)
-    tempo_map = Column(Text)
-    time_signature_map = Column(Text)
+    tempo_map = Column(Text)           # stored as JSON
+    time_signature_map = Column(Text)    # stored as JSON
     ticks_per_beat = Column(Integer)
     cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+
     project = relationship("Project", back_populates="midi_files")
     cue_group = relationship("CueGroup", back_populates="midi_files")
     tracks = relationship("MidiTrack", back_populates="midi_file")
@@ -51,6 +61,7 @@ class AudioFile(Base):
     instrument_category = Column(String, nullable=True)
     cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+
     project = relationship("Project", back_populates="audio_files")
     cue_group = relationship("CueGroup", back_populates="audio_files")
     features = relationship("AudioFeature", back_populates="audio_file")
@@ -61,8 +72,8 @@ class AudioFeature(Base):
     __tablename__ = "audio_features"
     id = Column(Integer, primary_key=True)
     audio_file_id = Column(Integer, ForeignKey("audio_files.id"))
-    feature_type = Column(String)
-    feature_data = Column(LargeBinary)
+    feature_type = Column(String)  # e.g., "mel_spectrogram"
+    feature_data = Column(LargeBinary)    # Stored as binary (npy format)
     audio_file = relationship("AudioFile", back_populates="features")
 
 # --- FinalMix Model ---
@@ -71,10 +82,11 @@ class FinalMix(Base):
     id = Column(Integer, primary_key=True)
     midi_file_id = Column(Integer, ForeignKey("midi_files.id"), unique=True)
     file_path = Column(String, unique=True)
-    feature_type = Column(String)
-    feature_data = Column(LargeBinary)
+    feature_type = Column(String)  # e.g., "mel_spectrogram"
+    feature_data = Column(LargeBinary)    # Stored as binary (npy format)
     cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+
     project = relationship("Project", back_populates="final_mixes")
     cue_group = relationship("CueGroup", back_populates="final_mixes")
     midi_file = relationship("MidiFile", back_populates="final_mix")
@@ -88,6 +100,7 @@ class MidiTrack(Base):
     track_name = Column(String)
     instrument_category = Column(String, nullable=True)
     assigned_audio_file_id = Column(Integer, ForeignKey("audio_files.id"), nullable=True)
+
     midi_file = relationship("MidiFile", back_populates="tracks")
     audio_file = relationship("AudioFile", back_populates="tracks")
     notes = relationship("MidiNote", back_populates="midi_track")
@@ -100,12 +113,12 @@ class MidiNote(Base):
     id = Column(Integer, primary_key=True)
     midi_track_id = Column(Integer, ForeignKey("midi_tracks.id"))
     channel = Column(Integer)
-    note = Column(Integer)
+    note = Column(Integer)  # MIDI note number
     velocity = Column(Integer)
     start_tick = Column(Integer)
     end_tick = Column(Integer)
-    start_time = Column(Float)
-    duration = Column(Float)
+    start_time = Column(Float)  # seconds
+    duration = Column(Float)    # seconds
     midi_track = relationship("MidiTrack", back_populates="notes")
 
 # --- MidiCC Model ---
@@ -117,7 +130,7 @@ class MidiCC(Base):
     cc_number = Column(Integer)
     cc_value = Column(Integer)
     tick = Column(Integer)
-    time = Column(Float)
+    time = Column(Float)  # seconds
     midi_track = relationship("MidiTrack", back_populates="cc_events")
 
 # --- MidiProgramChange Model ---
@@ -128,11 +141,11 @@ class MidiProgramChange(Base):
     channel = Column(Integer)
     program = Column(Integer)
     tick = Column(Integer)
-    time = Column(Float)
+    time = Column(Float)  # seconds
     midi_track = relationship("MidiTrack", back_populates="program_changes")
 
 # --- Database Configuration ---
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")  # Read from the .env file.
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 session = Session()

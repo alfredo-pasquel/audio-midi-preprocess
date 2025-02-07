@@ -31,12 +31,13 @@ if client.api_key is None:
     print("ERROR: OPENAI_API_KEY environment variable is not set.")
     sys.exit(1)
 
+# Add "Click" as a valid instrument category.
 INSTRUMENT_CATEGORIES = [
     "Strings", "Woodwinds", "Brass", "Electric Guitar", "Acoustic Guitar",
     "Piano", "Organ", "Bells", "Harp", "Synth Pulse", "Synth Pad", "Synth Bass",
     "Low Percussion", "Mid Percussion", "High Percussion", "Drums", "Orch Percussion",
     "Bass", "Double Bass", "FX", "Choir", "Solo Vocals", "Mallets", "Plucked",
-    "Sub Hits", "Guitar FX", "Orch FX", "Ticker"
+    "Sub Hits", "Guitar FX", "Orch FX", "Ticker", "Click"
 ]
 
 MARKER_KEYWORDS = ["NOTES", "CONDUCTOR", "ORCHESTRATOR", "MARKER", "MONITOR", "MIDI"]
@@ -291,7 +292,6 @@ def extract_midi_track_names(midi_path):
     return track_info
 
 
-# Modified match_track_to_audio: now the prompt forces a selection from the list.
 def match_track_to_audio(track_name, canonical_names):
     cleaned = clean_name(track_name)
     prompt = f"""
@@ -327,23 +327,16 @@ Always select one of the available names.
             temperature=0.1,
         )
         match = response.choices[0].message.content.strip()
-        # If GPT's answer is not exactly in the list, try fuzzy matching.
         if match.lower() not in [name.lower() for name in canonical_names]:
             best_match, score = fuzz_process.extractOne(match, canonical_names)
             return best_match if score >= 80 else best_match
         return match
     except Exception as e:
         print("Error during OpenAI API call (match_track_to_audio):", e)
-        # As a fallback, simply return the first candidate.
         return canonical_names[0] if canonical_names else None
 
 
-# New function: assign_common_category - use track names and audio group name
 def assign_common_category(track_names, audio_group):
-    """
-    Given a list of MIDI track names (as a comma‑separated string) that were matched to a given audio group,
-    ask GPT to choose a common instrument category for both the track(s) and the audio group.
-    """
     prompt = f"""
 You are given a set of MIDI track names and an audio group name, both referring to the same musical instrument
 (either acoustic or digital). Use the following common abbreviation mappings as reference:
@@ -365,7 +358,7 @@ Audio Group: **{audio_group}**
 
 Available Categories: **{', '.join(INSTRUMENT_CATEGORIES)}**
 
-Based on the above, select the most appropriate category that fits both the MIDI tracks and the audio group.
+Based on the above, select the most appropriate category for both the MIDI tracks and the audio group.
 Output only the exact category name.
 """
     try:
@@ -385,13 +378,14 @@ Output only the exact category name.
             return best_match if score >= 90 else best_match
     except Exception as e:
         print("Error during OpenAI API call (assign_common_category):", e)
-        # Fallback: use the category from the cleaned track name.
         return assign_instrument_category(track_names[0], INSTRUMENT_CATEGORIES)
 
 
-# Modified assign_instrument_category to always return a valid category (fallback if needed)
 def assign_instrument_category(item_name, categories):
     cleaned = clean_name(item_name)
+    # Special check for click files.
+    if "CLK" in cleaned.upper():
+        return "Click"
     normalized_name = cleaned.upper()
     for abbr, full in INSTRUMENT_ABBREVIATIONS.items():
         normalized_name = normalized_name.replace(abbr, full.upper())
@@ -436,7 +430,7 @@ Select the most logical category for this instrument and output only the exact c
             return best_match if score >= 90 else best_match
     except Exception as e:
         print("Error during OpenAI API call (assign_instrument_category):", e)
-        return categories[0]  # fallback to the first category
+        return categories[0]
 
 
 def process_cue(cue_dir, sample_rate, project_id):
@@ -493,7 +487,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         mapping[track_name] = best_match
         print(f"MIDI Track '{track_name}'  -->  Audio Group '{best_match}'")
     
-    # Build a dictionary mapping each audio group to a list of MIDI track names that matched it.
+    # Build a dictionary mapping each audio group to the list of MIDI track names that matched it.
     group_to_tracks = {}
     for track_name, group in mapping.items():
         if group is None:
@@ -516,7 +510,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         project_id=project_id
     )
 
-    # Process Final Mix files (using keyword filter)
+    # Process Final Mix files (using a keyword filter for '6MX' or 'REF')
     final_mix_groups = get_audio_file_groups(pt_dir, keyword_filter=lambda canonical: "6mx" in canonical or "ref" in canonical)
     if final_mix_groups:
         canonical_final = list(final_mix_groups.keys())[0]
@@ -543,8 +537,7 @@ def process_cue(cue_dir, sample_rate, project_id):
     for canonical in tqdm(canonical_names, desc="Inserting Instrument Audio Groups", leave=False):
         rep_file = audio_groups[canonical][0]
         full_path = os.path.join(pt_dir, os.path.basename(rep_file))
-        # If we already have a common category for this group from matching MIDI tracks, use that;
-        # otherwise, fall back to the original assignment.
+        # Use the common category if available; otherwise, fall back to individual assignment.
         if canonical in group_category:
             audio_cat = group_category[canonical]
         else:
@@ -561,7 +554,6 @@ def process_cue(cue_dir, sample_rate, project_id):
                 cue_group_id=cue_group_id,
                 project_id=project_id
             )
-        # If we have a common category for this group, update the record (if needed)
         audio_file_records[canonical] = rec.id
         if canonical in audio_features:
             insert_audio_feature(
@@ -688,7 +680,6 @@ def main():
         print("Invalid sample rate provided. Using default 48000 Hz.")
         sample_rate = 48000
 
-    # If project_id is provided, use it; otherwise, create a default project.
     if len(sys.argv) >= 4:
         project_id = int(sys.argv[3])
     else:
