@@ -37,10 +37,35 @@ INSTRUMENT_CATEGORIES = [
     "Bass", "Double Bass", "FX", "Choir", "Solo Vocals", "Mallets", "Plucked",
     "Sub Hits", "Guitar FX", "Orch FX", "Ticker"
 ]
-MARKER_KEYWORDS = ["NOTES", "CONDUCTOR", "ORCHESTRATOR"]
+
+MARKER_KEYWORDS = ["NOTES", "CONDUCTOR", "ORCHESTRATOR", "MARKER", "MONITOR", "MIDI"]
 
 # Define channel suffixes and their order (lower order values will be used first)
 CHANNEL_ORDER = {".L": 0, ".C": 1, ".R": 2, ".Ls": 3, ".Rs": 4, ".lfe": 5, ".Lf": 5}
+
+# --- Instrument abbreviation dictionary and category overrides ---
+INSTRUMENT_ABBREVIATIONS = {
+    "VCS": "Violoncello", "VLN": "Violin", "VLA": "Viola",
+    "SHT": "Short", "LG": "Long", "HARP": "Harp", "HPS": "Harps",
+    "BASS": "Bass", "PERC": "Percussion", "TPT": "Trumpet",
+    "TBN": "Trombone", "FL": "Flute", "OB": "Oboe", "CL": "Clarinet",
+    "BSN": "Bassoon", "SAX": "Saxophone", "GTR": "Guitar",
+    "SYN": "Synth", "FX": "Effects", "PAD": "Synth Pad",
+    "ORG": "Organ", "BELL": "Bells", "CHOIR": "Choir",
+    "VOX": "Solo Vocals", "MALLET": "Mallet Percussion",
+    "TAIKO": "Low Percussion", "TIMP": "Orch Percussion", "TIMPANI": "Orch Percussion"
+}
+
+CATEGORY_OVERRIDES = {
+    "Synth": "Synth Pad",
+    "Synth Lead": "Synth Pulse",
+    "Piano Pedal": "Piano",
+    "Percussion": "Drums",
+    "Taiko": "Low Percussion",
+    "Timpani": "Orch Percussion",
+    "Harp": "Harp"
+}
+
 
 def find_cue_directories(base_dir):
     cue_dirs = []
@@ -52,6 +77,7 @@ def find_cue_directories(base_dir):
             if mid_files:
                 cue_dirs.append(root)
     return cue_dirs
+
 
 # Import functions and DB models from server
 from server import (
@@ -73,12 +99,14 @@ from server import (
 
 init_db()
 
+
 def get_or_create_cue_group(cue_path):
     from server import CueGroup
     cue_group = get_cue_group_by_path(cue_path)
     if cue_group is None:
         cue_group = insert_cue_group(cue_path)
     return cue_group.id
+
 
 def get_audio_file_groups(audio_dir, keyword_filter=None):
     """
@@ -102,25 +130,17 @@ def get_audio_file_groups(audio_dir, keyword_filter=None):
                 canonical = canonical[:-len(suffix)]
                 file_order = order
                 break
-        # If a filter is provided, skip files whose canonical name does not match
         if keyword_filter and not keyword_filter(canonical.lower()):
             continue
         groups.setdefault(canonical, []).append((filepath, file_order))
-    # Sort each group based on file_order (None sorts last)
     sorted_groups = {}
     for canonical, file_list in groups.items():
         sorted_files = sorted(file_list, key=lambda x: x[1] if x[1] is not None else 999)
         sorted_groups[canonical] = [f[0] for f in sorted_files]
     return sorted_groups
 
+
 def combine_audio_group(file_list, sample_rate):
-    """
-    Combines multiple audio files into a composite.
-    - If only one file is present, it is loaded with mono=False so that interleaved multi-channel
-      data is preserved.
-    - If multiple files are provided (e.g. separate mono files for each channel), each is loaded as mono
-      and then stacked in the sorted order.
-    """
     if len(file_list) == 1:
         y, sr = librosa.load(file_list[0], sr=sample_rate, mono=False)
         if y.ndim == 1:
@@ -128,7 +148,7 @@ def combine_audio_group(file_list, sample_rate):
         return y
     else:
         signals = []
-        for f in file_list:
+        for f in tqdm(file_list, desc="Loading audio files", leave=False):
             y, sr = librosa.load(f, sr=sample_rate, mono=True)
             signals.append(y)
         if not signals:
@@ -138,12 +158,8 @@ def combine_audio_group(file_list, sample_rate):
         composite = np.stack(signals, axis=0)
         return composite
 
+
 def extract_audio_features_from_composite(y, sr=48000, n_mels=64, hop_length=512):
-    """
-    Extracts a mel-spectrogram from the composite audio.
-    For multi-channel audio, a spectrogram is computed per channel and then stacked so that the
-    final array has shape (n_mels, time, channels). The spectrogram is kept as a NumPy array.
-    """
     if y.ndim == 1:
         mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, hop_length=hop_length)
         mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
@@ -154,17 +170,29 @@ def extract_audio_features_from_composite(y, sr=48000, n_mels=64, hop_length=512
             mel_spec = librosa.feature.melspectrogram(y=y[ch], sr=sr, n_mels=n_mels, hop_length=hop_length)
             mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
             mel_specs.append(mel_spec_db)
-        mel_specs = np.stack(mel_specs, axis=-1)  # shape: (n_mels, time, channels)
+        mel_specs = np.stack(mel_specs, axis=-1)
         return mel_specs
 
+
 def serialize_feature_array(feature_array):
-    """
-    Serializes a NumPy array to binary (in npy format) for storage in the database.
-    """
     buf = io.BytesIO()
     np.save(buf, feature_array)
     buf.seek(0)
     return buf.read()
+
+
+def thin_midi_cc_events(events, tolerance=1, max_interval=0.05):
+    if not events:
+        return events
+    filtered = [events[0]]
+    last = events[0]
+    for event in events[1:]:
+        if abs(event['cc_value'] - last['cc_value']) <= tolerance and (event['time'] - last['time']) < max_interval:
+            continue
+        filtered.append(event)
+        last = event
+    return filtered
+
 
 def tick_to_bar_beat(abs_tick, ts_events, ticks_per_beat):
     total_measures = 0
@@ -184,6 +212,7 @@ def tick_to_bar_beat(abs_tick, ts_events, ticks_per_beat):
             beat_in_measure = remainder_ticks / beat_ticks
             return total_measures + 1, beat_in_measure + 1
     return 1, (abs_tick / ticks_per_beat) + 1
+
 
 def tick_to_time(abs_tick, tempo_map, ticks_per_beat):
     if not tempo_map:
@@ -206,6 +235,7 @@ def tick_to_time(abs_tick, tempo_map, ticks_per_beat):
     delta_ticks = abs_tick - prev_tick
     time_val += (delta_ticks / ticks_per_beat) * (last_tempo / 1e6)
     return time_val
+
 
 def extract_tempo_and_time_signature(midi_path):
     try:
@@ -238,6 +268,7 @@ def extract_tempo_and_time_signature(midi_path):
         time_signature_map.insert(0, (0.0, 0, 4, 4))
     return tempo_map, time_signature_map, ticks_per_beat
 
+
 def extract_midi_track_names(midi_path):
     mid = mido.MidiFile(midi_path)
     track_info = []
@@ -249,66 +280,76 @@ def extract_midi_track_names(midi_path):
                 break
         if track_name is None:
             track_name = f"Track {i}"
-        if any(keyword in track_name.lower() for keyword in MARKER_KEYWORDS):
+        if any(keyword in track_name.upper() for keyword in MARKER_KEYWORDS):
             continue
         track_info.append((i, track_name))
     return track_info
 
+
 def match_track_to_audio(track_name, canonical_names):
-    prompt = (
-        f"Given a MIDI track named '{track_name}', and a list of audio file canonical names: {', '.join(canonical_names)}, "
-        "determine which audio group best corresponds to the MIDI track. The relationship may be abstract. "
-        "Output only the exact canonical name from the list that best matches, or 'None' if no match."
-    )
+    prompt = f"""
+You are matching a MIDI track to an audio file.
+
+MIDI Track: **'{track_name}'**
+Available Audio Files: {', '.join(canonical_names)}
+
+Step 1: Look for exact matches first.
+Step 2: If no exact match is found, infer the best possible match based on instrument type.
+Step 3: Output only the **exact name** from the list or **'None'** if no match is found.
+"""
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4",
             messages=[
-                {"role": "system", "content": "You are an assistant that matches MIDI track names to audio file canonical names."},
+                {"role": "system", "content": "You match MIDI tracks to audio groups."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.0,
+            temperature=0.1,
         )
-        answer = response.choices[0].message.content.strip()
-        if answer.lower() not in [name.lower() for name in canonical_names]:
-            best_match, score = process.extractOne(answer, canonical_names)
-            if score >= 80:
-                return best_match
-            return None
-        return answer
+        match = response.choices[0].message.content.strip()
+        if match.lower() not in [name.lower() for name in canonical_names]:
+            best_match, score = process.extractOne(match, canonical_names)
+            return best_match if score >= 80 else None
+        return match
     except Exception as e:
-        print("Error during OpenAI API call (match_track_to_audio):")
-        print(e)
+        print("Error during OpenAI API call (match_track_to_audio):", e)
         return None
 
+
 def assign_instrument_category(item_name, categories):
+    normalized_name = item_name.upper()
+    for abbr, full in INSTRUMENT_ABBREVIATIONS.items():
+        normalized_name = normalized_name.replace(abbr, full)
+    if normalized_name in CATEGORY_OVERRIDES:
+        return CATEGORY_OVERRIDES[normalized_name]
     allowed = ", ".join(categories)
-    prompt = (
-        f"Given the following list of instrument categories: {allowed}. "
-        f"Assign the item '{item_name}' to exactly one category from the list. "
-        "Output only the category name exactly as it appears in the list."
-    )
+    prompt = f"""
+You are classifying an instrument into one of the predefined categories.
+
+Step 1: Consider the instrument name: **'{item_name}'** (normalized: **'{normalized_name}'**)
+Step 2: The available categories are: **{allowed}**
+Step 3: If the instrument name is unknown, reason based on its meaning.
+Step 4: Choose the most logical category and output only the exact name.
+"""
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4",
             messages=[
-                {"role": "system", "content": "You are an assistant that assigns instrument categories."},
+                {"role": "system", "content": "You classify musical instruments with reasoning."},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.0,
+            temperature=0.1,
         )
         category = response.choices[0].message.content.strip()
         if category in categories:
             return category
         else:
             best_match, score = process.extractOne(category, categories)
-            if score >= 80:
-                return best_match
-            return None
+            return best_match if score >= 90 else None
     except Exception as e:
-        print("Error during OpenAI API call (assign_instrument_category):")
-        print(e)
+        print("Error during OpenAI API call (assign_instrument_category):", e)
         return None
+
 
 def process_cue(cue_dir, sample_rate, project_id):
     print(f"\n=== Processing Cue: {cue_dir} ===")
@@ -336,7 +377,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         print("Audio Files folder not found in", os.path.join(cue_dir, "PT"))
         return
     
-    # Process track audio groups (all audio files in PT/Audio Files)
+    # Process track audio groups
     audio_groups = get_audio_file_groups(pt_dir)
     composite_audio = {}
     print("Processing Audio Groups in", pt_dir)
@@ -375,7 +416,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         project_id=project_id
     )
 
-    # Process Final Mix files (files with special nomenclature like "6MX" or "REF")
+    # Process Final Mix files (using a keyword filter)
     final_mix_groups = get_audio_file_groups(pt_dir, keyword_filter=lambda canonical: "6mx" in canonical or "ref" in canonical)
     if final_mix_groups:
         canonical_final = list(final_mix_groups.keys())[0]
@@ -385,7 +426,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         if composite_final_mix is not None:
             final_mix_features = extract_audio_features_from_composite(composite_final_mix, sr=int(sample_rate))
             binary_final_mix_features = serialize_feature_array(final_mix_features)
-            final_mix_file = final_mix_files[0]  # Representative file path
+            final_mix_file = final_mix_files[0]  # Representative file
             insert_final_mix(
                 midi_file_id=midi_file_record.id,
                 file_path=final_mix_file,
@@ -397,6 +438,7 @@ def process_cue(cue_dir, sample_rate, project_id):
     else:
         print("No final mix file (containing '6MX' or 'REF') found in", pt_dir)
 
+    # Process Instrument Audio Groups
     audio_file_records = {}
     for canonical in tqdm(canonical_names, desc="Processing Instrument Audio Groups", leave=False):
         rep_file = audio_groups[canonical][0]
@@ -421,6 +463,8 @@ def process_cue(cue_dir, sample_rate, project_id):
                 feature_type="mel_spectrogram",
                 feature_data=audio_features[canonical]
             )
+
+    # Insert MIDI Tracks
     midi_track_ids = {}
     for idx, track_name in tqdm(midi_tracks, desc="Inserting MIDI Tracks", leave=False):
         midi_cat = assign_instrument_category(track_name, INSTRUMENT_CATEGORIES)
@@ -437,6 +481,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         )
         midi_track_ids[idx] = rec.id
 
+    # Process MIDI track events (notes, CC, program changes)
     mid = mido.MidiFile(midi_file)
     allowed_track_indices = {idx for idx, _ in midi_tracks}
     for idx, track in enumerate(mid.tracks):
@@ -444,7 +489,8 @@ def process_cue(cue_dir, sample_rate, project_id):
             continue
         cumulative_tick = 0
         pending_notes = {}
-        for msg in track:
+        cc_events = []  # collect CC events for this track
+        for msg in tqdm(track, desc=f"Processing track {idx}", leave=False):
             cumulative_tick += msg.time
             event_time = tick_to_time(cumulative_tick, tempo_map, ticks_per_beat)
             if msg.type == "note_on":
@@ -479,14 +525,13 @@ def process_cue(cue_dir, sample_rate, project_id):
                         duration=duration
                     )
             elif msg.type == "control_change":
-                insert_midi_cc(
-                    midi_track_id=midi_track_ids.get(idx),
-                    channel=msg.channel,
-                    cc_number=msg.control,
-                    cc_value=msg.value,
-                    tick=cumulative_tick,
-                    time=event_time
-                )
+                cc_events.append({
+                    'channel': msg.channel,
+                    'cc_number': msg.control,
+                    'cc_value': msg.value,
+                    'tick': cumulative_tick,
+                    'time': event_time
+                })
             elif msg.type == "program_change":
                 insert_midi_program_change(
                     midi_track_id=midi_track_ids.get(idx),
@@ -495,7 +540,32 @@ def process_cue(cue_dir, sample_rate, project_id):
                     tick=cumulative_tick,
                     time=event_time
                 )
+        # Group and thin CC events per (channel, cc_number)
+        grouped = {}
+        for event in cc_events:
+            key = (event['channel'], event['cc_number'])
+            grouped.setdefault(key, []).append(event)
+        filtered_cc_events = []
+        for key, events in tqdm(grouped.items(), desc="Thinning CC events", leave=False):
+            channel, cc_number = key
+            if cc_number in [1, 11]:
+                events_sorted = sorted(events, key=lambda e: e['tick'])
+                thinned = thin_midi_cc_events(events_sorted, tolerance=1, max_interval=0.05)
+            else:
+                thinned = events
+            filtered_cc_events.extend(thinned)
+        filtered_cc_events.sort(key=lambda e: e['tick'])
+        for event in tqdm(filtered_cc_events, desc="Inserting CC events", leave=False):
+            insert_midi_cc(
+                midi_track_id=midi_track_ids.get(idx),
+                channel=event['channel'],
+                cc_number=event['cc_number'],
+                cc_value=event['cc_value'],
+                tick=event['tick'],
+                time=event['time']
+            )
     print(f"Finished processing cue: {cue_dir}")
+
 
 def main():
     if len(sys.argv) < 2:
@@ -509,7 +579,14 @@ def main():
         print("Invalid sample rate provided. Using default 48000 Hz.")
         sample_rate = 48000
 
-    project_id = int(sys.argv[3]) if len(sys.argv) >= 4 else None
+    # If project_id is provided, use it; otherwise, create a default project.
+    if len(sys.argv) >= 4:
+        project_id = int(sys.argv[3])
+    else:
+        from server import insert_project
+        project = insert_project("Current Project")
+        project_id = project.id
+        print(f"Created default project with id: {project_id}")
 
     cue_dirs = find_cue_directories(cue_base_dir)
     if not cue_dirs:
@@ -520,6 +597,7 @@ def main():
     for cue in tqdm(cue_dirs, desc="Processing Cues"):
         process_cue(cue, sample_rate, project_id)
     print("All cues have been processed.")
+
 
 if __name__ == '__main__':
     main()
