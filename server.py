@@ -34,9 +34,9 @@ class MidiFile(Base):
     tempo_map = Column(Text)           # stored as JSON
     time_signature_map = Column(Text)    # stored as JSON
     ticks_per_beat = Column(Integer)
-    cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)  # New foreign key to CueGroup
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
-    
+    cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)  # Foreign key to CueGroup
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)      # Foreign key to Project
+
     project = relationship("Project", back_populates="midi_files")
     cue_group = relationship("CueGroup", back_populates="midi_files")
     tracks = relationship("MidiTrack", back_populates="midi_file")
@@ -50,7 +50,7 @@ class AudioFile(Base):
     instrument_category = Column(String, nullable=True)
     cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
-    
+
     project = relationship("Project", back_populates="audio_files")
     cue_group = relationship("CueGroup", back_populates="audio_files")
     features = relationship("AudioFeature", back_populates="audio_file")
@@ -73,7 +73,7 @@ class FinalMix(Base):
     feature_data = Column(Text)    # JSON string representing the feature array
     cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
-    
+
     project = relationship("Project", back_populates="final_mixes")
     cue_group = relationship("CueGroup", back_populates="final_mixes")
     midi_file = relationship("MidiFile", back_populates="final_mix")
@@ -86,7 +86,7 @@ class MidiTrack(Base):
     track_name = Column(String)
     instrument_category = Column(String, nullable=True)
     assigned_audio_file_id = Column(Integer, ForeignKey("audio_files.id"), nullable=True)
-    
+
     midi_file = relationship("MidiFile", back_populates="tracks")
     audio_file = relationship("AudioFile", back_populates="tracks")
     notes = relationship("MidiNote", back_populates="midi_track")

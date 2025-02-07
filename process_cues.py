@@ -25,14 +25,11 @@ from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env
 
 # --- Configuration and Global Constants ---
-
-# Instantiate the OpenAI client.
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 if client.api_key is None:
     print("ERROR: OPENAI_API_KEY environment variable is not set.")
     sys.exit(1)
 
-# Updated list of instrument categories.
 INSTRUMENT_CATEGORIES = [
     "Strings", "Woodwinds", "Brass", "Electric Guitar", "Acoustic Guitar",
     "Piano", "Organ", "Bells", "Harp", "Synth Pulse", "Synth Pad", "Synth Bass",
@@ -40,20 +37,9 @@ INSTRUMENT_CATEGORIES = [
     "Bass", "Double Bass", "FX", "Choir", "Solo Vocals", "Mallets", "Plucked",
     "Sub Hits", "Guitar FX", "Orch FX", "Ticker"
 ]
-
-# Marker keywords to filter out non-musical or marker tracks.
 MARKER_KEYWORDS = ["notes", "conductor", "orchestrator"]
 
-# --- Function to Find Cue Directories ---
-
 def find_cue_directories(base_dir):
-    """
-    Recursively search the base directory for cue directories.
-    A valid cue directory is one that:
-      - Contains a "MIDI" subfolder with at least one .mid file.
-      - Contains a "PT/Audio Files" subfolder.
-    Returns a list of full paths to valid cue directories.
-    """
     cue_dirs = []
     for root, dirs, files in os.walk(base_dir):
         midi_dir = os.path.join(root, "MIDI")
@@ -64,8 +50,6 @@ def find_cue_directories(base_dir):
                 cue_dirs.append(root)
     return cue_dirs
 
-# --- Database Functions ---
-# These functions (and the session & models) are assumed to be defined in server.py.
 from server import (
     init_db,
     insert_midi_file,
@@ -78,35 +62,26 @@ from server import (
     insert_midi_program_change,
     get_cue_group_by_path,
     insert_cue_group,
-    session,  # SQLAlchemy session object
-    MidiFile,   # Database model for MIDI files
-    AudioFile   # Database model for Audio files
+    session,
+    MidiFile,
+    AudioFile
 )
 
-# Initialize the database.
 init_db()
 
 def get_or_create_cue_group(cue_path):
-    """Retrieve an existing CueGroup by cue_path or create a new one."""
-    from server import CueGroup  # Import here to avoid circular import issues.
+    from server import CueGroup
     cue_group = get_cue_group_by_path(cue_path)
     if cue_group is None:
         cue_group = insert_cue_group(cue_path)
     return cue_group.id
 
-# --- Audio File Grouping and Combination Functions ---
-
 def get_audio_file_groups(audio_dir):
-    """
-    Scan the given directory for common audio file types and group them by canonical name.
-    Returns a dictionary mapping canonical name -> list of full file paths.
-    """
     audio_extensions = ["*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"]
     found_files = []
     for ext in audio_extensions:
         found_files.extend(glob.glob(os.path.join(audio_dir, ext)))
     groups = {}
-    # Updated list of channel suffixes to include additional variants.
     channel_suffixes = [".L", ".C", ".R", ".Ls", ".Rs", ".lfe", ".Lf", ".Rf"]
     for filepath in found_files:
         base = os.path.basename(filepath)
@@ -120,12 +95,6 @@ def get_audio_file_groups(audio_dir):
     return groups
 
 def combine_audio_group(file_list, sample_rate):
-    """
-    Load each file in file_list. If only one file is present, load it with all its channels
-    (interleaved mode). Otherwise, assume each file is a mono recording representing one channel,
-    trim to the shortest length, and stack them to create a multi-channel composite.
-    Returns an array with shape (channels, samples).
-    """
     if len(file_list) == 1:
         y, sr = librosa.load(file_list[0], sr=sample_rate, mono=False)
         if y.ndim == 1:
@@ -144,12 +113,6 @@ def combine_audio_group(file_list, sample_rate):
         return composite
 
 def extract_audio_features_from_composite(y, sr=48000, n_mels=64, hop_length=512):
-    """
-    Compute a mel-spectrogram (in dB) from a composite waveform y.
-    If y is mono (1D), compute a single spectrogram.
-    If y is multi-channel (2D: channels x samples), compute a spectrogram for each channel
-    and return a nested list with shape (n_mels, time_steps, channels).
-    """
     if y.ndim == 1:
         mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, hop_length=hop_length)
         mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
@@ -162,8 +125,6 @@ def extract_audio_features_from_composite(y, sr=48000, n_mels=64, hop_length=512
             mel_specs.append(mel_spec_db)
         mel_specs = np.stack(mel_specs, axis=-1)
         return mel_specs.tolist()
-
-# --- MIDI Processing Functions ---
 
 def tick_to_bar_beat(abs_tick, ts_events, ticks_per_beat):
     total_measures = 0
@@ -214,7 +175,7 @@ def extract_tempo_and_time_signature(midi_path):
         sys.exit(1)
     ticks_per_beat = mid.ticks_per_beat
     merged_track = mido.merge_tracks(mid.tracks)
-    current_tempo = 500000  # default tempo in µs per beat
+    current_tempo = 500000
     abs_time = 0.0
     abs_ticks = 0
     tempo_map = []
@@ -309,11 +270,8 @@ def assign_instrument_category(item_name, categories):
         print(e)
         return None
 
-# --- Main Processing Loop for Each Cue Directory ---
-
-def process_cue(cue_dir, sample_rate):
+def process_cue(cue_dir, sample_rate, project_id):
     print(f"\n=== Processing Cue: {cue_dir} ===")
-    # Locate the MIDI file.
     midi_dir = os.path.join(cue_dir, "MIDI")
     mid_files = glob.glob(os.path.join(midi_dir, "*.mid"))
     if not mid_files:
@@ -322,22 +280,17 @@ def process_cue(cue_dir, sample_rate):
     midi_file = mid_files[0]
     print("Processing MIDI file:", midi_file)
     
-    # Duplicate-check: Skip cue if MIDI file already exists in the database.
-    from server import MidiFile  # Ensure MidiFile model is imported
+    from server import MidiFile
     existing_midi = session.query(MidiFile).filter_by(file_path=midi_file).first()
     if existing_midi:
         print(f"MIDI file {midi_file} is already processed. Skipping cue.")
         return
 
-    # Get or create the cue group record for this cue.
     cue_group_id = get_or_create_cue_group(cue_dir)
-
-    # Process MIDI data.
     tempo_map, time_signature_map, ticks_per_beat = extract_tempo_and_time_signature(midi_file)
     ts_events = sorted([(ts_tick, num, den) for (_, ts_tick, num, den) in time_signature_map], key=lambda x: x[0])
     midi_tracks = extract_midi_track_names(midi_file)
 
-    # Process audio groups from PT/Audio Files.
     pt_dir = os.path.join(cue_dir, "PT", "Audio Files")
     if not os.path.exists(pt_dir):
         print("Audio Files folder not found in", os.path.join(cue_dir, "PT"))
@@ -350,7 +303,6 @@ def process_cue(cue_dir, sample_rate):
         if composite is not None:
             composite_audio[canonical] = composite
 
-    # Extract audio features.
     audio_features = {}
     for canonical, waveform in tqdm(composite_audio.items(), desc="Extracting Features", leave=False):
         features = extract_audio_features_from_composite(waveform, sr=int(sample_rate))
@@ -370,15 +322,15 @@ def process_cue(cue_dir, sample_rate):
         else:
             print(f"MIDI Track '{track_name}'  -->  No matching audio group found.")
 
-    # --- Insert MIDI file record into DB ---
     midi_file_record = insert_midi_file(
         file_path=midi_file,
         tempo_map=json.dumps(tempo_map),
         time_signature_map=json.dumps(time_signature_map),
-        ticks_per_beat=ticks_per_beat
+        ticks_per_beat=ticks_per_beat,
+        cue_group_id=cue_group_id,
+        project_id=project_id
     )
 
-    # --- Process and insert final mix file ---
     final_mix_files = []
     for f in glob.glob(os.path.join(pt_dir, "*")):
         if os.path.isfile(f):
@@ -389,7 +341,6 @@ def process_cue(cue_dir, sample_rate):
     if final_mix_files:
         final_mix_file = final_mix_files[0]
         print("Processing Final Mix file:", final_mix_file)
-        # For the final mix, we load with mono=True (adjust if you need multi-channel)
         y_final, sr_final = librosa.load(final_mix_file, sr=sample_rate, mono=True)
         final_mix_features = extract_audio_features_from_composite(y_final, sr=int(sample_rate))
         insert_final_mix(
@@ -397,18 +348,17 @@ def process_cue(cue_dir, sample_rate):
             file_path=final_mix_file,
             feature_type="mel_spectrogram",
             feature_data=json.dumps(final_mix_features),
-            cue_group_id=cue_group_id
+            cue_group_id=cue_group_id,
+            project_id=project_id
         )
     else:
         print("No final mix file (containing '6MX') found in", pt_dir)
 
-    # --- Process individual instrument audio groups ---
     audio_file_records = {}
     for canonical in tqdm(canonical_names, desc="Processing Instrument Audio Groups", leave=False):
         rep_file = audio_groups[canonical][0]
         full_path = os.path.join(pt_dir, os.path.basename(rep_file))
         audio_cat = assign_instrument_category(canonical, INSTRUMENT_CATEGORIES)
-        # Duplicate-check for audio files:
         existing_audio = session.query(AudioFile).filter_by(file_path=full_path).first()
         if existing_audio:
             print(f"Audio file {full_path} already exists in the database. Skipping insertion.")
@@ -418,7 +368,8 @@ def process_cue(cue_dir, sample_rate):
                 file_path=full_path,
                 canonical_name=canonical,
                 instrument_category=audio_cat,
-                cue_group_id=cue_group_id
+                cue_group_id=cue_group_id,
+                project_id=project_id
             )
         audio_file_records[canonical] = rec.id
         if canonical in audio_features:
@@ -443,7 +394,6 @@ def process_cue(cue_dir, sample_rate):
         )
         midi_track_ids[idx] = rec.id
 
-    # Detailed MIDI event extraction.
     mid = mido.MidiFile(midi_file)
     allowed_track_indices = {idx for idx, _ in midi_tracks}
     for idx, track in enumerate(mid.tracks):
@@ -506,7 +456,7 @@ def process_cue(cue_dir, sample_rate):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python process_cues.py <cue_base_directory> [sample_rate]")
+        print("Usage: python process_cues.py <cue_base_directory> [sample_rate] [project_id]")
         sys.exit(1)
     
     cue_base_dir = sys.argv[1]
@@ -516,6 +466,8 @@ def main():
         print("Invalid sample rate provided. Using default 48000 Hz.")
         sample_rate = 48000
 
+    project_id = int(sys.argv[3]) if len(sys.argv) >= 4 else None
+
     cue_dirs = find_cue_directories(cue_base_dir)
     if not cue_dirs:
         print("No cue directories found under", cue_base_dir)
@@ -523,7 +475,7 @@ def main():
 
     print(f"Found {len(cue_dirs)} cue directories. Beginning processing...")
     for cue in tqdm(cue_dirs, desc="Processing Cues"):
-        process_cue(cue, sample_rate)
+        process_cue(cue, sample_rate, project_id)
     print("All cues have been processed.")
 
 if __name__ == '__main__':
