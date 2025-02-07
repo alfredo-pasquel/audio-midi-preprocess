@@ -144,12 +144,6 @@ python process_cues.py "/path/to/cues/base/directory" [sample_rate] [project_id]
 
 ---
 
-## License
-
-This project is released under the MIT License.
-
----
-
 ## Contact
 
 For questions, issues, or contributions, please open an issue on GitHub or contact the maintainer at info@alfredopasquel.com.
