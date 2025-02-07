@@ -4,9 +4,9 @@ process_cues.py
 
 This script recursively scans a base cues directory for projects (each cue folder must contain a "MIDI"
 subfolder with a .mid file and a "PT/Audio Files" subfolder). It processes the MIDI and audio files,
-extracts features (preserving multi‑channel information), maps MIDI tracks to audio groups via OpenAI's Batch API,
-determines a common instrument category for matched tracks and audio groups, and inserts the data into
-a database. Audio features are serialized as binary (numpy .npy format) for efficiency.
+extracts features (preserving multi‑channel information), maps MIDI tracks to audio groups via OpenAI’s Batch API,
+determines a common instrument category for matched tracks and audio groups, and inserts the data into a database.
+Audio features are serialized as binary (numpy .npy format) for efficiency.
 """
 
 import os
@@ -16,12 +16,11 @@ import json
 import io
 import re
 import time
-import tempfile
 import mido
 import numpy as np
 import librosa
 from tqdm import tqdm
-import openai  # using the migrated interface
+import openai  # Using openai>=1.0.0 (make sure to run `openai migrate` if needed)
 from thefuzz import process as fuzz_process
 from dotenv import load_dotenv
 
@@ -53,11 +52,13 @@ INSTRUMENT_ABBREVIATIONS = {
     "TBN": "Trombone", "FL": "Flute", "OB": "Oboe", "CL": "Clarinet",
     "BSN": "Bassoon", "SAX": "Saxophone", "GTR": "Guitar",
     "SYN": "Synth", "FX": "Effects", "PAD": "Synth Pad",
-    "ORG": "Keys",  # keys include organs, rhodes, celeste, etc.
+    "ORG": "Keys",  # Organ, Rhodes, celeste, etc.
     "BELL": "Bells", "CHOIR": "Choir",
     "VOX": "Solo Vocals", "MALLET": "Mallet Percussion",
-    "TAKO": "Low Percussion", "TKO": "Low Percussion",  # TKO or Taiko go in low perc
-    "TIMP": "Orch Percussion", "TIMPANI": "Orch Percussion"
+    "TAKO": "Low Percussion", "TKO": "Low Percussion",  # TKO maps to Taiko in low perc
+    "TIMP": "Orch Percussion", "TIMPANI": "Orch Percussion",
+    "SNR": "Mid Percussion",  # SNR (snare) → mid perc
+    "CYM": "High Percussion"  # cymbal → high perc
 }
 
 CATEGORY_OVERRIDES = {
@@ -65,7 +66,7 @@ CATEGORY_OVERRIDES = {
     "Synth Lead": "Synth Pulse",
     "Piano Pedal": "Piano",
     "Percussion": "Drums",
-    "Taiko": "Low Percussion",
+    "Taiko": "Low Percussion",  # Taiko always in low perc
     "Timpani": "Orch Percussion",
     "Harp": "Harp"
 }
@@ -134,6 +135,9 @@ def get_audio_file_groups(audio_dir, keyword_filter=None):
                 canonical = canonical[:-len(suffix)]
                 file_order = order
                 break
+        # Exclude the click track from grouping for MIDI assignment.
+        if "CLK" in canonical.upper():
+            continue
         if keyword_filter and not keyword_filter(canonical.lower()):
             continue
         groups.setdefault(canonical, []).append((filepath, file_order))
@@ -281,144 +285,82 @@ def extract_midi_track_names(midi_path):
         track_info.append((i, track_name))
     return track_info
 
-# === Batch API Manager ===
+# --- BatchManager for asynchronous (batch) Chat requests ---
 class BatchManager:
     def __init__(self):
-        self.requests = []  # list of dicts for each GPT request
-        self.counter = 0
+        self.requests = []  # List of request dictionaries
 
-    def _generate_custom_id(self, prefix):
-        self.counter += 1
-        return f"{prefix}_{self.counter}"
-
-    def queue_chat_request(self, prompt, system_prompt, temperature=0.1):
-        custom_id = self._generate_custom_id("req")
-        body = {
-            "model": "gpt-4",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": temperature,
-        }
+    def queue_chat_request(self, prompt, system_prompt, custom_id):
         request = {
             "custom_id": custom_id,
             "method": "POST",
             "url": "/v1/chat/completions",
-            "body": body
+            "body": {
+                "model": "gpt-4",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 20  # Adjust as needed
+            }
         }
         self.requests.append(request)
-        return custom_id
 
     def execute_batch(self):
-        # Write queued requests to a temporary JSONL file
-        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".jsonl") as f:
+        # Write requests to a JSONL file
+        input_filename = "batch_input.jsonl"
+        with open(input_filename, "w", encoding="utf-8") as f:
             for req in self.requests:
                 f.write(json.dumps(req) + "\n")
-            file_path = f.name
 
-        # Upload the file via Files API with purpose "batch"
-        upload_resp = openai.File.create(
-            file=open(file_path, "rb"),
-            purpose="batch"
-        )
-        file_id = upload_resp["id"]
+        # Upload the file using the new upload method.
+        # (If you encounter errors with openai.File.create, run `openai migrate` or pin your version.)
+        try:
+            upload_resp = openai.File.upload(file=open(input_filename, "rb"), purpose="batch")
+        except Exception as e:
+            print("Error uploading batch file:", e)
+            sys.exit(1)
 
-        # Create the batch job
-        batch_resp = openai.batches.create(
-            input_file_id=file_id,
-            endpoint="/v1/chat/completions",
-            completion_window="24h"
-        )
-        batch_id = batch_resp["id"]
+        input_file_id = upload_resp["id"]
 
-        # Poll until the batch is complete
+        # Create the batch
+        try:
+            batch = openai.Batches.create(
+                input_file_id=input_file_id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h"
+            )
+        except Exception as e:
+            print("Error creating batch:", e)
+            sys.exit(1)
+
+        batch_id = batch["id"]
+        # Poll for completion (simple polling – adjust sleep interval as needed)
+        print(f"Batch {batch_id} created. Waiting for completion...")
         while True:
-            batch_status = openai.batches.retrieve(batch_id)
+            batch_status = openai.Batches.retrieve(batch_id)
             status = batch_status["status"]
             if status == "completed":
                 break
-            elif status in ["failed", "expired", "cancelled"]:
-                raise Exception(f"Batch job failed with status: {status}")
-            time.sleep(5)  # wait 5 seconds before checking again
-
+            elif status in ["failed", "expired"]:
+                print(f"Batch {batch_id} failed or expired. Status: {status}")
+                sys.exit(1)
+            else:
+                time.sleep(10)
+        # Retrieve the output file
         output_file_id = batch_status["output_file_id"]
-        output_resp = openai.File.content(output_file_id)
-        # Assume output_resp is bytes; decode to string
-        output_text = output_resp.decode("utf-8") if isinstance(output_resp, bytes) else output_resp
-
+        output_resp = openai.File.download(output_file_id)
+        # The output file is a JSONL file; parse each line
         results = {}
-        for line in output_text.splitlines():
-            if line.strip():
-                data = json.loads(line)
-                cid = data.get("custom_id")
-                # Extract the answer from the response
-                if data.get("response") and data["response"].get("body"):
-                    message = data["response"]["body"]["choices"][0]["message"]["content"]
-                    results[cid] = message
-                else:
-                    results[cid] = None
-
-        # Clear the queue
+        for line in output_resp.decode("utf-8").splitlines():
+            resp_line = json.loads(line)
+            results[resp_line["custom_id"]] = resp_line["response"]["body"]["choices"][0]["message"]["content"].strip()
+        # Clear the batch queue after execution
         self.requests = []
         return results
 
-# === GPT Request Queue Functions ===
-
-def queue_match_track_to_audio(batch_manager, track_name, canonical_names):
-    cleaned = clean_name(track_name)
-    prompt = f"""
-You are matching a MIDI track to an audio group. The track name may include special characters,
-abbreviations, or extra symbols but always refers to a musical instrument (acoustic or digital).
-Consider the following known abbreviation mappings (and other common variants):
-    VCS → Violoncello (Cello)
-    VLN → Violin
-    VLA → Viola
-    CBS → Contrabasses
-    HARP → Harp
-    PNO → Piano
-    PICC → Piccolo
-    TPT → Trumpet
-    TBN → Trombone
-    TUBA → Tuba
-    TKO → Taiko
-    PERC → Percussion
-MIDI Track: **'{track_name}'** (cleaned: **'{cleaned}'**)
-Available Audio Groups: {', '.join(canonical_names)}
-Please choose the one audio group name from the list that best matches the instrument indicated by the MIDI track.
-Note: Do not select any audio group that appears to be a click track (i.e. containing "CLK").
-"""
-    system_prompt = "You match MIDI tracks to audio groups. Always select one of the available names."
-    return batch_manager.queue_chat_request(prompt, system_prompt)
-
-def queue_assign_instrument_category(batch_manager, item_name):
-    cleaned = clean_name(item_name)
-    normalized_name = cleaned.upper()
-    for abbr, full in INSTRUMENT_ABBREVIATIONS.items():
-        normalized_name = normalized_name.replace(abbr, full.upper())
-    allowed = ", ".join(INSTRUMENT_CATEGORIES)
-    prompt = f"""
-You are classifying a musical instrument into one of the predefined categories.
-The instrument name may be abbreviated or contain extra symbols. Consider the following common abbreviation mappings:
-    VCS → Violoncello (Cello)
-    VLN → Violin
-    VLA → Viola
-    CBS → Contrabasses
-    HARP → Harp
-    PNO → Piano
-    PICC → Piccolo
-    TPT → Trumpet
-    TBN → Trombone
-    TUBA → Tuba
-    TKO → Taiko
-    PERC → Percussion
-Instrument Name: **'{item_name}'** (cleaned: **'{cleaned}'**, normalized: **'{normalized_name}'**)
-Available Categories: **{allowed}**
-Select the most logical category for this instrument and output only the exact category name.
-"""
-    system_prompt = "You classify musical instruments using clear abbreviation mappings."
-    return batch_manager.queue_chat_request(prompt, system_prompt)
-
+# --- Chat request functions using batch manager ---
 def queue_assign_common_category(batch_manager, track_names, audio_group):
     prompt = f"""
 You are given a set of MIDI track names and an audio group name, both referring to the same musical instrument
@@ -442,10 +384,56 @@ Based on the above, select the most appropriate category that fits both the MIDI
 Output only the exact category name.
 """
     system_prompt = "You classify musical instruments and select a common category for both MIDI tracks and audio groups."
-    return batch_manager.queue_chat_request(prompt, system_prompt)
+    custom_id = f"assign_common_{audio_group}"
+    batch_manager.queue_chat_request(prompt, system_prompt, custom_id)
 
-# === Main Processing Function ===
+def assign_instrument_category(item_name, categories):
+    cleaned = clean_name(item_name)
+    normalized_name = cleaned.upper()
+    for abbr, full in INSTRUMENT_ABBREVIATIONS.items():
+        normalized_name = normalized_name.replace(abbr, full.upper())
+    if normalized_name in CATEGORY_OVERRIDES:
+        return CATEGORY_OVERRIDES[normalized_name]
+    allowed = ", ".join(categories)
+    prompt = f"""
+You are classifying a musical instrument into one of the predefined categories.
+The instrument name may be abbreviated or contain extra symbols. Consider the following common abbreviation mappings:
+    VCS → Violoncello (Cello)
+    VLN → Violin
+    VLA → Viola
+    CBS → Contrabasses
+    HARP → Harp
+    PNO → Piano
+    PICC → Piccolo
+    TPT → Trumpet
+    TBN → Trombone
+    TUBA → Tuba
+    TKO → Taiko
+    PERC → Percussion
+Instrument Name: **'{item_name}'** (cleaned: **'{cleaned}'**, normalized: **'{normalized_name}'**)
+Available Categories: **{allowed}**
+Select the most logical category for this instrument and output only the exact category name.
+"""
+    try:
+        response = client.ChatCompletion.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You classify musical instruments using clear abbreviation mappings."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+        )
+        category = response["choices"][0]["message"]["content"].strip()
+        if category in categories:
+            return category
+        else:
+            best_match, score = fuzz_process.extractOne(category, categories)
+            return best_match if score >= 90 else best_match
+    except Exception as e:
+        print("Error during OpenAI API call (assign_instrument_category):", e)
+        return categories[0]  # fallback to the first category
 
+# --- Main processing function ---
 def process_cue(cue_dir, sample_rate, project_id):
     print(f"\n=== Processing Cue: {cue_dir} ===")
     midi_dir = os.path.join(cue_dir, "MIDI")
@@ -456,7 +444,6 @@ def process_cue(cue_dir, sample_rate, project_id):
     midi_file = mid_files[0]
     print("Processing MIDI file:", midi_file)
     
-    # Skip cue if MIDI already processed
     from server import MidiFile
     existing_midi = session.query(MidiFile).filter_by(file_path=midi_file).first()
     if existing_midi:
@@ -494,73 +481,43 @@ def process_cue(cue_dir, sample_rate, project_id):
     for name in canonical_names:
         print("  ", name)
 
-    # --- Use BatchManager to handle GPT calls ---
-    batch_manager = BatchManager()
-
-    # Queue match requests for each MIDI track to an audio group
-    match_requests = {}  # track_name -> custom_id
+    # Match MIDI tracks to audio groups
+    mapping = {}
     for idx, track_name in midi_tracks:
-        cid = queue_match_track_to_audio(batch_manager, track_name, canonical_names)
-        match_requests[track_name] = cid
-
-    # (We’ll later queue instrument category requests for audio groups and for MIDI tracks.)
-    # We'll also build a mapping from audio group to list of track names that were matched.
-    # For now, let’s wait for all the "match" requests.
-    batch_results = batch_manager.execute_batch()
-    mapping = {}  # track_name -> audio group name (from GPT)
-    for track_name, cid in match_requests.items():
-        mapping[track_name] = batch_results.get(cid)
-
-    # Build dictionary: audio group -> list of MIDI track names that were mapped to it.
+        best_match = None
+        # Queue batch requests for matching (if needed, here we call synchronously)
+        best_match = None
+        try:
+            best_match = client.ChatCompletion.create(
+                model="gpt-4",
+                messages=[
+                    {"role": "system", "content": "You match MIDI tracks to audio groups. Always select one of the available names."},
+                    {"role": "user", "content": f"Match the following MIDI track to one of these audio group names.\nMIDI Track: {track_name}\nAvailable Audio Groups: {', '.join(canonical_names)}"}
+                ],
+                temperature=0.1,
+            )["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print("Error in synchronous matching:", e)
+        if best_match is None or best_match.lower() not in [name.lower() for name in canonical_names]:
+            best_match, score = fuzz_process.extractOne(best_match, canonical_names)
+        mapping[track_name] = best_match
+        print(f"MIDI Track '{track_name}'  -->  Audio Group '{best_match}'")
+    
+    # Build a dictionary mapping each audio group to a list of MIDI track names that matched it.
     group_to_tracks = {}
     for track_name, group in mapping.items():
         if group is None:
             continue
         group_to_tracks.setdefault(group, []).append(track_name)
-
-    # Queue common category requests for each audio group that has matched MIDI tracks.
-    common_category_requests = {}  # audio group -> custom_id
-    for group, tracks in group_to_tracks.items():
-        cid = queue_assign_common_category(batch_manager, tracks, group)
-        common_category_requests[group] = cid
-
-    # Queue instrument category requests for any audio group that did not get a common category yet.
-    # (If an audio group wasn’t matched by any MIDI track, we fall back to individual assignment.)
-    fallback_category_requests = {}  # for each audio group with no common category
-    for group in canonical_names:
-        if group not in common_category_requests:
-            cid = queue_assign_instrument_category(batch_manager, group)
-            fallback_category_requests[group] = cid
-
-    # Queue instrument category requests for each MIDI track that did not get mapped
-    midi_category_requests = {}  # track_name -> custom_id for fallback assignment
-    for idx, track_name in midi_tracks:
-        if mapping.get(track_name) is None:
-            cid = queue_assign_instrument_category(batch_manager, track_name)
-            midi_category_requests[track_name] = cid
-
-    # Execute all queued GPT requests
-    batch_results = batch_manager.execute_batch()
-
-    # Build final group category mapping: for each audio group that had common category queued.
+    
+    # Use the Batch API to queue common category assignments
+    batch_manager = BatchManager()
     group_category = {}
-    for group, cid in common_category_requests.items():
-        cat = batch_results.get(cid)
-        if cat:
-            group_category[group] = cat
-    # For audio groups with no common category, use fallback
-    for group, cid in fallback_category_requests.items():
-        if group not in group_category:
-            cat = batch_results.get(cid)
-            if cat:
-                group_category[group] = cat
-
-    # For MIDI tracks that did not get mapped, assign category individually
-    midi_track_category = {}
-    for track_name, cid in midi_category_requests.items():
-        cat = batch_results.get(cid)
-        if cat:
-            midi_track_category[track_name] = cat
+    for group, tracks in group_to_tracks.items():
+        queue_assign_common_category(batch_manager, tracks, group)
+    batch_results = batch_manager.execute_batch()
+    for group, category in batch_results.items():
+        group_category[group.replace("assign_common_", "")] = category
 
     # Insert MIDI file record
     midi_file_record = insert_midi_file(
@@ -599,14 +556,11 @@ def process_cue(cue_dir, sample_rate, project_id):
     for canonical in tqdm(canonical_names, desc="Inserting Instrument Audio Groups", leave=False):
         rep_file = audio_groups[canonical][0]
         full_path = os.path.join(pt_dir, os.path.basename(rep_file))
-        # Use common category if available; else, fall back to assigning via instrument category
+        # Use common category if available; otherwise use assign_instrument_category
         if canonical in group_category:
             audio_cat = group_category[canonical]
         else:
-            audio_cat = queue_assign_instrument_category(batch_manager, canonical)
-            # Execute immediately for this single request (or later add it to a fallback dictionary)
-            batch_results = batch_manager.execute_batch()
-            audio_cat = batch_results.get(audio_cat, INSTRUMENT_CATEGORIES[0])
+            audio_cat = assign_instrument_category(canonical, INSTRUMENT_CATEGORIES)
         existing_audio = session.query(AudioFile).filter_by(file_path=full_path).first()
         if existing_audio:
             print(f"Audio file {full_path} already exists in the database. Skipping insertion.")
@@ -627,17 +581,13 @@ def process_cue(cue_dir, sample_rate, project_id):
                 feature_data=audio_features[canonical]
             )
 
-    # Insert MIDI Tracks – use the common category if available, or fallback to individual assignment.
+    # Insert MIDI Tracks – use common category if available.
     midi_track_ids = {}
     for idx, track_name in tqdm(midi_tracks, desc="Inserting MIDI Tracks", leave=False):
         if mapping.get(track_name) is not None and mapping[track_name] in group_category:
             midi_cat = group_category[mapping[track_name]]
         else:
-            midi_cat = midi_track_category.get(track_name)
-            if midi_cat is None:
-                midi_cat = queue_assign_instrument_category(batch_manager, track_name)
-                batch_results = batch_manager.execute_batch()
-                midi_cat = batch_results.get(midi_cat, INSTRUMENT_CATEGORIES[0])
+            midi_cat = assign_instrument_category(track_name, INSTRUMENT_CATEGORIES)
         assigned_audio_id = None
         if mapping.get(track_name):
             canonical = mapping[track_name]
@@ -710,7 +660,7 @@ def process_cue(cue_dir, sample_rate, project_id):
                     tick=cumulative_tick,
                     time=event_time
                 )
-        # Group and thin out control change (CC) events by (channel, cc_number)
+        # Group and thin out CC events
         grouped = {}
         for event in cc_events:
             key = (event['channel'], event['cc_number'])
