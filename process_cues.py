@@ -2,10 +2,10 @@
 """
 process_cues.py
 
-This script recursively scans a base cues directory for projects (each cue folder
-must contain a "MIDI" subfolder with a .mid file and a "PT/Audio Files" subfolder).
-It processes the MIDI and audio files, extracts features (preserving multi-channel
-information), maps MIDI tracks to audio groups via OpenAI, and inserts the data into
+This script recursively scans a base cues directory for projects (each cue folder must contain a "MIDI"
+subfolder with a .mid file and a "PT/Audio Files" subfolder). It processes the MIDI and audio files,
+extracts features (preserving multi‑channel information), maps MIDI tracks to audio groups via OpenAI,
+determines a common instrument category for matched tracks and audio groups, and inserts the data into
 a database. Audio features are serialized as binary (numpy .npy format) for efficiency.
 """
 
@@ -14,12 +14,13 @@ import sys
 import glob
 import json
 import io
+import re
 import mido
 import numpy as np
 import librosa
 from tqdm import tqdm
 import openai  # using the migrated interface
-from thefuzz import process
+from thefuzz import process as fuzz_process
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env
@@ -40,7 +41,6 @@ INSTRUMENT_CATEGORIES = [
 
 MARKER_KEYWORDS = ["NOTES", "CONDUCTOR", "ORCHESTRATOR", "MARKER", "MONITOR", "MIDI"]
 
-# Define channel suffixes and their order (lower order values will be used first)
 CHANNEL_ORDER = {".L": 0, ".C": 1, ".R": 2, ".Ls": 3, ".Rs": 4, ".lfe": 5, ".Lf": 5}
 
 # --- Instrument abbreviation dictionary and category overrides ---
@@ -65,6 +65,16 @@ CATEGORY_OVERRIDES = {
     "Timpani": "Orch Percussion",
     "Harp": "Harp"
 }
+
+
+# --- Helper function: clean_name ---
+def clean_name(name):
+    """
+    Removes any characters except alphanumeric and spaces, and collapses extra whitespace.
+    """
+    cleaned = re.sub(r'[^\w\s]', '', name)
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    return cleaned.strip()
 
 
 def find_cue_directories(base_dir):
@@ -94,7 +104,8 @@ from server import (
     insert_cue_group,
     session,
     MidiFile,
-    AudioFile
+    AudioFile,
+    insert_project
 )
 
 init_db()
@@ -109,12 +120,6 @@ def get_or_create_cue_group(cue_path):
 
 
 def get_audio_file_groups(audio_dir, keyword_filter=None):
-    """
-    Scans the directory for audio files. If keyword_filter is provided (a function that accepts
-    the canonical name and returns True/False), only those files will be included.
-    Files are grouped by their canonical name (with any recognized channel suffix removed) and
-    then sorted within each group according to CHANNEL_ORDER.
-    """
     audio_extensions = ["*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"]
     found_files = []
     for ext in audio_extensions:
@@ -286,56 +291,139 @@ def extract_midi_track_names(midi_path):
     return track_info
 
 
+# Modified match_track_to_audio: now the prompt forces a selection from the list.
 def match_track_to_audio(track_name, canonical_names):
+    cleaned = clean_name(track_name)
     prompt = f"""
-You are matching a MIDI track to an audio file.
+You are matching a MIDI track to an audio group. The track name may include special characters,
+abbreviations, or extra symbols but always refers to a musical instrument (acoustic or digital).
+Consider the following known abbreviation mappings (and other common variants):
+    VCS → Violoncello (Cello)
+    VLN → Violin
+    VLA → Viola
+    CBS → Contrabasses
+    HARP → Harp
+    PNO → Piano
+    PICC → Piccolo
+    TPT → Trumpet
+    TBN → Trombone
+    TUBA → Tuba
+    TKO → Taiko
+    PERC → Percussion
 
-MIDI Track: **'{track_name}'**
-Available Audio Files: {', '.join(canonical_names)}
+MIDI Track: **'{track_name}'** (cleaned: **'{cleaned}'**)
+Available Audio Groups: {', '.join(canonical_names)}
 
-Step 1: Look for exact matches first.
-Step 2: If no exact match is found, infer the best possible match based on instrument type.
-Step 3: Output only the **exact name** from the list or **'None'** if no match is found.
+Please choose the one audio group name from the list that best matches the instrument indicated by the MIDI track.
+Always select one of the available names.
 """
     try:
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You match MIDI tracks to audio groups."},
+                {"role": "system", "content": "You match MIDI tracks to audio groups. Always select one of the available names."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
         )
         match = response.choices[0].message.content.strip()
+        # If GPT's answer is not exactly in the list, try fuzzy matching.
         if match.lower() not in [name.lower() for name in canonical_names]:
-            best_match, score = process.extractOne(match, canonical_names)
-            return best_match if score >= 80 else None
+            best_match, score = fuzz_process.extractOne(match, canonical_names)
+            return best_match if score >= 80 else best_match
         return match
     except Exception as e:
         print("Error during OpenAI API call (match_track_to_audio):", e)
-        return None
+        # As a fallback, simply return the first candidate.
+        return canonical_names[0] if canonical_names else None
 
 
-def assign_instrument_category(item_name, categories):
-    normalized_name = item_name.upper()
-    for abbr, full in INSTRUMENT_ABBREVIATIONS.items():
-        normalized_name = normalized_name.replace(abbr, full)
-    if normalized_name in CATEGORY_OVERRIDES:
-        return CATEGORY_OVERRIDES[normalized_name]
-    allowed = ", ".join(categories)
+# New function: assign_common_category - use track names and audio group name
+def assign_common_category(track_names, audio_group):
+    """
+    Given a list of MIDI track names (as a comma‑separated string) that were matched to a given audio group,
+    ask GPT to choose a common instrument category for both the track(s) and the audio group.
+    """
     prompt = f"""
-You are classifying an instrument into one of the predefined categories.
+You are given a set of MIDI track names and an audio group name, both referring to the same musical instrument
+(either acoustic or digital). Use the following common abbreviation mappings as reference:
+    VCS → Violoncello (Cello)
+    VLN → Violin
+    VLA → Viola
+    CBS → Contrabasses
+    HARP → Harp
+    PNO → Piano
+    PICC → Piccolo
+    TPT → Trumpet
+    TBN → Trombone
+    TUBA → Tuba
+    TKO → Taiko
+    PERC → Percussion
 
-Step 1: Consider the instrument name: **'{item_name}'** (normalized: **'{normalized_name}'**)
-Step 2: The available categories are: **{allowed}**
-Step 3: If the instrument name is unknown, reason based on its meaning.
-Step 4: Choose the most logical category and output only the exact name.
+MIDI Tracks: **{', '.join(track_names)}**
+Audio Group: **{audio_group}**
+
+Available Categories: **{', '.join(INSTRUMENT_CATEGORIES)}**
+
+Based on the above, select the most appropriate category that fits both the MIDI tracks and the audio group.
+Output only the exact category name.
 """
     try:
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": "You classify musical instruments with reasoning."},
+                {"role": "system", "content": "You classify musical instruments and select a common category for both MIDI tracks and audio groups."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+        )
+        common_category = response.choices[0].message.content.strip()
+        if common_category in INSTRUMENT_CATEGORIES:
+            return common_category
+        else:
+            best_match, score = fuzz_process.extractOne(common_category, INSTRUMENT_CATEGORIES)
+            return best_match if score >= 90 else best_match
+    except Exception as e:
+        print("Error during OpenAI API call (assign_common_category):", e)
+        # Fallback: use the category from the cleaned track name.
+        return assign_instrument_category(track_names[0], INSTRUMENT_CATEGORIES)
+
+
+# Modified assign_instrument_category to always return a valid category (fallback if needed)
+def assign_instrument_category(item_name, categories):
+    cleaned = clean_name(item_name)
+    normalized_name = cleaned.upper()
+    for abbr, full in INSTRUMENT_ABBREVIATIONS.items():
+        normalized_name = normalized_name.replace(abbr, full.upper())
+    if normalized_name in CATEGORY_OVERRIDES:
+        return CATEGORY_OVERRIDES[normalized_name]
+    allowed = ", ".join(categories)
+    prompt = f"""
+You are classifying a musical instrument into one of the predefined categories.
+The instrument name may be abbreviated or contain extra symbols. Consider the following common abbreviation mappings:
+    VCS → Violoncello (Cello)
+    VLN → Violin
+    VLA → Viola
+    CBS → Contrabasses
+    HARP → Harp
+    PNO → Piano
+    PICC → Piccolo
+    TPT → Trumpet
+    TBN → Trombone
+    TUBA → Tuba
+    TKO → Taiko
+    PERC → Percussion
+
+Instrument Name: **'{item_name}'** (cleaned: **'{cleaned}'**, normalized: **'{normalized_name}'**)
+Available Categories: **{allowed}**
+
+Select the most logical category for this instrument and output only the exact category name.
+"""
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You classify musical instruments using clear abbreviation mappings."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.1,
@@ -344,11 +432,11 @@ Step 4: Choose the most logical category and output only the exact name.
         if category in categories:
             return category
         else:
-            best_match, score = process.extractOne(category, categories)
-            return best_match if score >= 90 else None
+            best_match, score = fuzz_process.extractOne(category, categories)
+            return best_match if score >= 90 else best_match
     except Exception as e:
         print("Error during OpenAI API call (assign_instrument_category):", e)
-        return None
+        return categories[0]  # fallback to the first category
 
 
 def process_cue(cue_dir, sample_rate, project_id):
@@ -376,7 +464,7 @@ def process_cue(cue_dir, sample_rate, project_id):
     if not os.path.exists(pt_dir):
         print("Audio Files folder not found in", os.path.join(cue_dir, "PT"))
         return
-    
+
     # Process track audio groups
     audio_groups = get_audio_file_groups(pt_dir)
     composite_audio = {}
@@ -386,9 +474,9 @@ def process_cue(cue_dir, sample_rate, project_id):
         if composite is not None:
             composite_audio[canonical] = composite
 
-    # Extract features for track audio groups and serialize as binary
+    # Extract audio features for each audio group
     audio_features = {}
-    for canonical, waveform in tqdm(composite_audio.items(), desc="Extracting Features", leave=False):
+    for canonical, waveform in tqdm(composite_audio.items(), desc="Extracting Audio Features", leave=False):
         features = extract_audio_features_from_composite(waveform, sr=int(sample_rate))
         binary_features = serialize_feature_array(features)
         audio_features[canonical] = binary_features
@@ -398,15 +486,27 @@ def process_cue(cue_dir, sample_rate, project_id):
     for name in canonical_names:
         print("  ", name)
 
+    # Match MIDI tracks to audio groups
     mapping = {}
     for idx, track_name in midi_tracks:
         best_match = match_track_to_audio(track_name, canonical_names)
         mapping[track_name] = best_match
-        if best_match:
-            print(f"MIDI Track '{track_name}'  -->  Audio Group '{best_match}'")
-        else:
-            print(f"MIDI Track '{track_name}'  -->  No matching audio group found.")
+        print(f"MIDI Track '{track_name}'  -->  Audio Group '{best_match}'")
+    
+    # Build a dictionary mapping each audio group to a list of MIDI track names that matched it.
+    group_to_tracks = {}
+    for track_name, group in mapping.items():
+        if group is None:
+            continue
+        group_to_tracks.setdefault(group, []).append(track_name)
+    
+    # For each audio group with matched MIDI tracks, assign a common instrument category.
+    group_category = {}
+    for group, tracks in group_to_tracks.items():
+        common_cat = assign_common_category(tracks, group)
+        group_category[group] = common_cat
 
+    # Insert MIDI file record
     midi_file_record = insert_midi_file(
         file_path=midi_file,
         tempo_map=json.dumps(tempo_map),
@@ -416,7 +516,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         project_id=project_id
     )
 
-    # Process Final Mix files (using a keyword filter)
+    # Process Final Mix files (using keyword filter)
     final_mix_groups = get_audio_file_groups(pt_dir, keyword_filter=lambda canonical: "6mx" in canonical or "ref" in canonical)
     if final_mix_groups:
         canonical_final = list(final_mix_groups.keys())[0]
@@ -426,7 +526,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         if composite_final_mix is not None:
             final_mix_features = extract_audio_features_from_composite(composite_final_mix, sr=int(sample_rate))
             binary_final_mix_features = serialize_feature_array(final_mix_features)
-            final_mix_file = final_mix_files[0]  # Representative file
+            final_mix_file = final_mix_files[0]
             insert_final_mix(
                 midi_file_id=midi_file_record.id,
                 file_path=final_mix_file,
@@ -438,12 +538,17 @@ def process_cue(cue_dir, sample_rate, project_id):
     else:
         print("No final mix file (containing '6MX' or 'REF') found in", pt_dir)
 
-    # Process Instrument Audio Groups
+    # Process Instrument Audio Groups: insert audio files and their features
     audio_file_records = {}
-    for canonical in tqdm(canonical_names, desc="Processing Instrument Audio Groups", leave=False):
+    for canonical in tqdm(canonical_names, desc="Inserting Instrument Audio Groups", leave=False):
         rep_file = audio_groups[canonical][0]
         full_path = os.path.join(pt_dir, os.path.basename(rep_file))
-        audio_cat = assign_instrument_category(canonical, INSTRUMENT_CATEGORIES)
+        # If we already have a common category for this group from matching MIDI tracks, use that;
+        # otherwise, fall back to the original assignment.
+        if canonical in group_category:
+            audio_cat = group_category[canonical]
+        else:
+            audio_cat = assign_instrument_category(canonical, INSTRUMENT_CATEGORIES)
         existing_audio = session.query(AudioFile).filter_by(file_path=full_path).first()
         if existing_audio:
             print(f"Audio file {full_path} already exists in the database. Skipping insertion.")
@@ -456,6 +561,7 @@ def process_cue(cue_dir, sample_rate, project_id):
                 cue_group_id=cue_group_id,
                 project_id=project_id
             )
+        # If we have a common category for this group, update the record (if needed)
         audio_file_records[canonical] = rec.id
         if canonical in audio_features:
             insert_audio_feature(
@@ -464,10 +570,13 @@ def process_cue(cue_dir, sample_rate, project_id):
                 feature_data=audio_features[canonical]
             )
 
-    # Insert MIDI Tracks
+    # Insert MIDI Tracks – use the common category if available.
     midi_track_ids = {}
     for idx, track_name in tqdm(midi_tracks, desc="Inserting MIDI Tracks", leave=False):
-        midi_cat = assign_instrument_category(track_name, INSTRUMENT_CATEGORIES)
+        if mapping.get(track_name) is not None and mapping[track_name] in group_category:
+            midi_cat = group_category[mapping[track_name]]
+        else:
+            midi_cat = assign_instrument_category(track_name, INSTRUMENT_CATEGORIES)
         assigned_audio_id = None
         if mapping.get(track_name):
             canonical = mapping[track_name]
@@ -481,7 +590,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         )
         midi_track_ids[idx] = rec.id
 
-    # Process MIDI track events (notes, CC, program changes)
+    # Process MIDI track events: notes, control changes, program changes
     mid = mido.MidiFile(midi_file)
     allowed_track_indices = {idx for idx, _ in midi_tracks}
     for idx, track in enumerate(mid.tracks):
@@ -489,8 +598,8 @@ def process_cue(cue_dir, sample_rate, project_id):
             continue
         cumulative_tick = 0
         pending_notes = {}
-        cc_events = []  # collect CC events for this track
-        for msg in tqdm(track, desc=f"Processing track {idx}", leave=False):
+        cc_events = []  # Collect CC events for this track
+        for msg in tqdm(track, desc=f"Processing MIDI events for track {idx}", leave=False):
             cumulative_tick += msg.time
             event_time = tick_to_time(cumulative_tick, tempo_map, ticks_per_beat)
             if msg.type == "note_on":
@@ -540,7 +649,7 @@ def process_cue(cue_dir, sample_rate, project_id):
                     tick=cumulative_tick,
                     time=event_time
                 )
-        # Group and thin CC events per (channel, cc_number)
+        # Group and thin out control change (CC) events by (channel, cc_number)
         grouped = {}
         for event in cc_events:
             key = (event['channel'], event['cc_number'])
@@ -583,7 +692,6 @@ def main():
     if len(sys.argv) >= 4:
         project_id = int(sys.argv[3])
     else:
-        from server import insert_project
         project = insert_project("Current Project")
         project_id = project.id
         print(f"Created default project with id: {project_id}")
