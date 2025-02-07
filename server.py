@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Text, Float
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, Text, Float, LargeBinary
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.ext.declarative import declarative_base
 from dotenv import load_dotenv
@@ -8,7 +8,7 @@ load_dotenv()
 
 Base = declarative_base()
 
-# --- New CueGroup Model ---
+# --- CueGroup Model ---
 class CueGroup(Base):
     __tablename__ = "cue_groups"
     id = Column(Integer, primary_key=True)
@@ -18,7 +18,7 @@ class CueGroup(Base):
     final_mixes = relationship("FinalMix", back_populates="cue_group")
     midi_files = relationship("MidiFile", back_populates="cue_group")
 
-# --- New Project Model ---
+# --- Project Model ---
 class Project(Base):
     __tablename__ = "projects"
     id = Column(Integer, primary_key=True)
@@ -34,8 +34,8 @@ class MidiFile(Base):
     tempo_map = Column(Text)           # stored as JSON
     time_signature_map = Column(Text)    # stored as JSON
     ticks_per_beat = Column(Integer)
-    cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)  # Foreign key to CueGroup
-    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)      # Foreign key to Project
+    cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
+    project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
 
     project = relationship("Project", back_populates="midi_files")
     cue_group = relationship("CueGroup", back_populates="midi_files")
@@ -61,7 +61,7 @@ class AudioFeature(Base):
     id = Column(Integer, primary_key=True)
     audio_file_id = Column(Integer, ForeignKey("audio_files.id"))
     feature_type = Column(String)  # e.g., "mel_spectrogram"
-    feature_data = Column(Text)    # JSON string representing the feature array
+    feature_data = Column(LargeBinary)    # Stored as binary (npy format)
     audio_file = relationship("AudioFile", back_populates="features")
 
 class FinalMix(Base):
@@ -70,7 +70,7 @@ class FinalMix(Base):
     midi_file_id = Column(Integer, ForeignKey("midi_files.id"), unique=True)
     file_path = Column(String, unique=True)
     feature_type = Column(String)  # e.g., "mel_spectrogram"
-    feature_data = Column(Text)    # JSON string representing the feature array
+    feature_data = Column(LargeBinary)    # Stored as binary (npy format)
     cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
 

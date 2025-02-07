@@ -4,28 +4,28 @@ process_cues.py
 
 This script recursively scans a base cues directory for projects (each cue folder
 must contain a "MIDI" subfolder with a .mid file and a "PT/Audio Files" subfolder).
-It then processes the MIDI and audio files, extracts features, maps MIDI tracks to audio
-groups using OpenAI, and inserts the data into a database.
-
-Duplicate-checking is performed based on file_path so that cues already catalogued are skipped.
+It processes the MIDI and audio files, extracts features (preserving multi-channel
+information), maps MIDI tracks to audio groups via OpenAI, and inserts the data into
+a database. Audio features are serialized as binary (numpy .npy format) for efficiency.
 """
 
 import os
 import sys
 import glob
 import json
+import io
 import mido
 import numpy as np
 import librosa
 from tqdm import tqdm
-from openai import OpenAI  # using the migrated interface
+import openai  # using the migrated interface
 from thefuzz import process
 from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env
 
 # --- Configuration and Global Constants ---
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 if client.api_key is None:
     print("ERROR: OPENAI_API_KEY environment variable is not set.")
     sys.exit(1)
@@ -37,7 +37,10 @@ INSTRUMENT_CATEGORIES = [
     "Bass", "Double Bass", "FX", "Choir", "Solo Vocals", "Mallets", "Plucked",
     "Sub Hits", "Guitar FX", "Orch FX", "Ticker"
 ]
-MARKER_KEYWORDS = ["notes", "conductor", "orchestrator"]
+MARKER_KEYWORDS = ["NOTES", "CONDUCTOR", "ORCHESTRATOR"]
+
+# Define channel suffixes and their order (lower order values will be used first)
+CHANNEL_ORDER = {".L": 0, ".C": 1, ".R": 2, ".Ls": 3, ".Rs": 4, ".lfe": 5, ".Lf": 5}
 
 def find_cue_directories(base_dir):
     cue_dirs = []
@@ -50,6 +53,7 @@ def find_cue_directories(base_dir):
                 cue_dirs.append(root)
     return cue_dirs
 
+# Import functions and DB models from server
 from server import (
     init_db,
     insert_midi_file,
@@ -76,25 +80,47 @@ def get_or_create_cue_group(cue_path):
         cue_group = insert_cue_group(cue_path)
     return cue_group.id
 
-def get_audio_file_groups(audio_dir):
+def get_audio_file_groups(audio_dir, keyword_filter=None):
+    """
+    Scans the directory for audio files. If keyword_filter is provided (a function that accepts
+    the canonical name and returns True/False), only those files will be included.
+    Files are grouped by their canonical name (with any recognized channel suffix removed) and
+    then sorted within each group according to CHANNEL_ORDER.
+    """
     audio_extensions = ["*.wav", "*.mp3", "*.flac", "*.ogg", "*.m4a"]
     found_files = []
     for ext in audio_extensions:
         found_files.extend(glob.glob(os.path.join(audio_dir, ext)))
     groups = {}
-    channel_suffixes = [".L", ".C", ".R", ".Ls", ".Rs", ".lfe", ".Lf", ".Rf"]
     for filepath in found_files:
         base = os.path.basename(filepath)
         name, _ = os.path.splitext(base)
         canonical = name
-        for suffix in channel_suffixes:
+        file_order = None
+        for suffix, order in CHANNEL_ORDER.items():
             if canonical.endswith(suffix):
                 canonical = canonical[:-len(suffix)]
+                file_order = order
                 break
-        groups.setdefault(canonical, []).append(filepath)
-    return groups
+        # If a filter is provided, skip files whose canonical name does not match
+        if keyword_filter and not keyword_filter(canonical.lower()):
+            continue
+        groups.setdefault(canonical, []).append((filepath, file_order))
+    # Sort each group based on file_order (None sorts last)
+    sorted_groups = {}
+    for canonical, file_list in groups.items():
+        sorted_files = sorted(file_list, key=lambda x: x[1] if x[1] is not None else 999)
+        sorted_groups[canonical] = [f[0] for f in sorted_files]
+    return sorted_groups
 
 def combine_audio_group(file_list, sample_rate):
+    """
+    Combines multiple audio files into a composite.
+    - If only one file is present, it is loaded with mono=False so that interleaved multi-channel
+      data is preserved.
+    - If multiple files are provided (e.g. separate mono files for each channel), each is loaded as mono
+      and then stacked in the sorted order.
+    """
     if len(file_list) == 1:
         y, sr = librosa.load(file_list[0], sr=sample_rate, mono=False)
         if y.ndim == 1:
@@ -107,24 +133,38 @@ def combine_audio_group(file_list, sample_rate):
             signals.append(y)
         if not signals:
             return None
-        min_len = min(len(y) for y in signals)
-        signals = [y[:min_len] for y in signals]
+        min_len = min(len(s) for s in signals)
+        signals = [s[:min_len] for s in signals]
         composite = np.stack(signals, axis=0)
         return composite
 
 def extract_audio_features_from_composite(y, sr=48000, n_mels=64, hop_length=512):
+    """
+    Extracts a mel-spectrogram from the composite audio.
+    For multi-channel audio, a spectrogram is computed per channel and then stacked so that the
+    final array has shape (n_mels, time, channels). The spectrogram is kept as a NumPy array.
+    """
     if y.ndim == 1:
         mel_spec = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=n_mels, hop_length=hop_length)
         mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
-        return mel_spec_db.tolist()
+        return mel_spec_db
     else:
         mel_specs = []
         for ch in range(y.shape[0]):
             mel_spec = librosa.feature.melspectrogram(y=y[ch], sr=sr, n_mels=n_mels, hop_length=hop_length)
             mel_spec_db = librosa.power_to_db(mel_spec, ref=np.max)
             mel_specs.append(mel_spec_db)
-        mel_specs = np.stack(mel_specs, axis=-1)
-        return mel_specs.tolist()
+        mel_specs = np.stack(mel_specs, axis=-1)  # shape: (n_mels, time, channels)
+        return mel_specs
+
+def serialize_feature_array(feature_array):
+    """
+    Serializes a NumPy array to binary (in npy format) for storage in the database.
+    """
+    buf = io.BytesIO()
+    np.save(buf, feature_array)
+    buf.seek(0)
+    return buf.read()
 
 def tick_to_bar_beat(abs_tick, ts_events, ticks_per_beat):
     total_measures = 0
@@ -295,6 +335,8 @@ def process_cue(cue_dir, sample_rate, project_id):
     if not os.path.exists(pt_dir):
         print("Audio Files folder not found in", os.path.join(cue_dir, "PT"))
         return
+    
+    # Process track audio groups (all audio files in PT/Audio Files)
     audio_groups = get_audio_file_groups(pt_dir)
     composite_audio = {}
     print("Processing Audio Groups in", pt_dir)
@@ -303,10 +345,12 @@ def process_cue(cue_dir, sample_rate, project_id):
         if composite is not None:
             composite_audio[canonical] = composite
 
+    # Extract features for track audio groups and serialize as binary
     audio_features = {}
     for canonical, waveform in tqdm(composite_audio.items(), desc="Extracting Features", leave=False):
         features = extract_audio_features_from_composite(waveform, sr=int(sample_rate))
-        audio_features[canonical] = features
+        binary_features = serialize_feature_array(features)
+        audio_features[canonical] = binary_features
 
     canonical_names = list(audio_groups.keys())
     print("Canonical Audio Groups:")
@@ -331,28 +375,27 @@ def process_cue(cue_dir, sample_rate, project_id):
         project_id=project_id
     )
 
-    final_mix_files = []
-    for f in glob.glob(os.path.join(pt_dir, "*")):
-        if os.path.isfile(f):
-            base = os.path.basename(f)
-            name, _ = os.path.splitext(base)
-            if "6mx" in name.lower():
-                final_mix_files.append(f)
-    if final_mix_files:
-        final_mix_file = final_mix_files[0]
-        print("Processing Final Mix file:", final_mix_file)
-        y_final, sr_final = librosa.load(final_mix_file, sr=sample_rate, mono=True)
-        final_mix_features = extract_audio_features_from_composite(y_final, sr=int(sample_rate))
-        insert_final_mix(
-            midi_file_id=midi_file_record.id,
-            file_path=final_mix_file,
-            feature_type="mel_spectrogram",
-            feature_data=json.dumps(final_mix_features),
-            cue_group_id=cue_group_id,
-            project_id=project_id
-        )
+    # Process Final Mix files (files with special nomenclature like "6MX" or "REF")
+    final_mix_groups = get_audio_file_groups(pt_dir, keyword_filter=lambda canonical: "6mx" in canonical or "ref" in canonical)
+    if final_mix_groups:
+        canonical_final = list(final_mix_groups.keys())[0]
+        final_mix_files = final_mix_groups[canonical_final]
+        print("Processing Final Mix group:", canonical_final)
+        composite_final_mix = combine_audio_group(final_mix_files, sample_rate)
+        if composite_final_mix is not None:
+            final_mix_features = extract_audio_features_from_composite(composite_final_mix, sr=int(sample_rate))
+            binary_final_mix_features = serialize_feature_array(final_mix_features)
+            final_mix_file = final_mix_files[0]  # Representative file path
+            insert_final_mix(
+                midi_file_id=midi_file_record.id,
+                file_path=final_mix_file,
+                feature_type="mel_spectrogram",
+                feature_data=binary_final_mix_features,
+                cue_group_id=cue_group_id,
+                project_id=project_id
+            )
     else:
-        print("No final mix file (containing '6MX') found in", pt_dir)
+        print("No final mix file (containing '6MX' or 'REF') found in", pt_dir)
 
     audio_file_records = {}
     for canonical in tqdm(canonical_names, desc="Processing Instrument Audio Groups", leave=False):
@@ -376,7 +419,7 @@ def process_cue(cue_dir, sample_rate, project_id):
             insert_audio_feature(
                 audio_file_id=rec.id,
                 feature_type="mel_spectrogram",
-                feature_data=json.dumps(audio_features[canonical])
+                feature_data=audio_features[canonical]
             )
     midi_track_ids = {}
     for idx, track_name in tqdm(midi_tracks, desc="Inserting MIDI Tracks", leave=False):
