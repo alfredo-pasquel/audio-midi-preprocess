@@ -3,29 +3,17 @@
 process_cues.py
 
 This script recursively scans a base cues directory for projects (each cue folder must contain a "MIDI"
-subfolder with a .mid file and a "PT/Audio Files" subfolder). It processes the MIDI and audio files,
-tokenizes the audio using EnCodec for MusicGen (using the 48 kHz AudioCraft model rather than mel-spectrograms),
+subfolder with .mid file(s) and a "PT/Audio Files" subfolder). It processes the MIDI and audio files,
+tokenizes the audio using EnCodec for MusicGen (the 48 kHz AudioCraft model, from transformers),
 and uses the OpenAI Batch API to do the classification (track->group + common category) asynchronously.
 
 Finally, once a MIDI track is matched to an audio group and we have a final "common instrument category,"
-we **update both**:
+we update both:
   - the MIDI track (in `midi_tracks.instrument_category`)
   - the associated `audio_files.instrument_category`
 to ensure consistency.
 
 Audio features are serialized as binary (numpy .npy format) for efficiency.
-
-For surround files (whether provided as interleaved multi-channel files or as separate mono files):
-  - If the audio group contains exactly two files (with channel labels “L” and “R” or with no labels),
-    they are assumed already stereo and no additional downmix is applied.
-  - Otherwise (e.g. LCR, Quad, 5.0), a custom downmix is performed using these per-channel gains:
-      • L: 0 dB (×1.0)
-      • C: –3 dB (×0.707)
-      • R: 0 dB (×1.0)
-      • Ls: –6 dB (×0.5)
-      • Rs: –6 dB (×0.5)
-      • LFE: –9 dB (×0.3548)
-Since EnCodec (48 kHz) supports only stereo input, any surround file is downmixed to stereo.
 """
 
 import os
@@ -35,11 +23,14 @@ import json
 import io
 import re
 import time
+import logging  # <-- For optional debug logging
 
+# Third-Party Packages
 import mido
 import numpy as np
 import librosa
 import torch
+import torch.nn.functional as F
 import torchaudio
 from tqdm import tqdm
 from thefuzz import process as fuzz_process
@@ -47,8 +38,19 @@ from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env
 
-# --- OpenAI Batch API Setup ---
-# Using 'OpenAI' for the Batch API (from the official docs).
+# ---------------------------------------------------------------------
+# Setup Logging (Optional)
+# ---------------------------------------------------------------------
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------
+# OpenAI Batch API Setup
+# ---------------------------------------------------------------------
 from openai import OpenAI
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -56,40 +58,44 @@ if client.api_key is None:
     print("ERROR: OPENAI_API_KEY environment variable is not set.")
     sys.exit(1)
 
-# --- AudioCraft EnCodec 48 kHz ---
-# We install AudioCraft from GitHub and import its EnCodec model:
+# ---------------------------------------------------------------------
+# AudioCraft EnCodec 48 kHz from transformers
+# ---------------------------------------------------------------------
 from audiocraft.models.encodec import CompressionModel
 
 def convert_audio(audio_tensor: torch.Tensor, src_sr: int, dst_sr: int, dst_channels: int):
     """
-    Similar to old `encodec.utils.convert_audio`, but here we do:
+    A utility to:
       1) Resample from src_sr to dst_sr using torchaudio
       2) Convert channel count if needed
     audio_tensor shape = (batch_size, channels, num_samples)
     """
-    # Resample if needed:
     if src_sr != dst_sr:
         audio_tensor = torchaudio.functional.resample(audio_tensor, src_sr, dst_sr)
 
-    # Adjust channels
     cur_channels = audio_tensor.shape[1]
     if cur_channels != dst_channels:
         if dst_channels == 1:
-            # average to mono
             audio_tensor = audio_tensor.mean(dim=1, keepdim=True)
         elif dst_channels == 2 and cur_channels == 1:
-            # replicate mono -> stereo
             audio_tensor = audio_tensor.repeat(1, 2, 1)
         else:
-            print(f"Warning: cannot automatically convert from {cur_channels} ch to {dst_channels} ch.")
+            logger.warning(
+                f"Cannot automatically convert from {cur_channels} channels to {dst_channels} channels."
+            )
     return audio_tensor
 
-# Load the 48 kHz EnCodec model globally
+# Load the 48 kHz model
 global encodec_model
 encodec_model = CompressionModel.get_pretrained("facebook/encodec_48khz")
 encodec_model.eval()
 
-# --- Configuration and Global Constants ---
+logger.info("Loaded AudioCraft EnCodec 48k model.")
+# (Note: Some versions do not expose a .config attribute directly.)
+
+# ---------------------------------------------------------------------
+# Global Configuration & Constants
+# ---------------------------------------------------------------------
 INSTRUMENT_CATEGORIES = [
     "Strings", "Woodwinds", "Brass", "Acoustic Guitar", "Electric Guitar",
     "Piano", "Keys", "Bells", "Harp", "Synth Pulse", "Synth Pad", "Synth Bass",
@@ -130,8 +136,10 @@ CATEGORY_OVERRIDES = {
     "Harp": "Harp"
 }
 
+# ---------------------------------------------------------------------
+# Helper Functions
+# ---------------------------------------------------------------------
 def clean_name(name):
-    """Remove non-alphanumeric (except whitespace) and collapse whitespace."""
     cleaned = re.sub(r'[^\w\s]', '', name)
     cleaned = re.sub(r'\s+', ' ', cleaned)
     return cleaned.strip()
@@ -147,7 +155,7 @@ def find_cue_directories(base_dir):
                 cue_dirs.append(root)
     return cue_dirs
 
-# --- Import database functions and models from server ---
+# Database imports
 from server import (
     init_db,
     insert_midi_file,
@@ -204,10 +212,10 @@ def get_audio_file_groups(audio_dir, keyword_filter=None):
     return sorted_groups
 
 def downmix_interleaved(y):
-    """Downmix 6-channel 5.1 to stereo. Otherwise fallback to naive averaging."""
     if y.shape[0] < 2:
         return y
     if y.shape[0] == 6:
+        # 5.1 -> stereo
         left = y[0] + 0.707 * y[2] + 0.5 * y[4] + 0.3548 * y[3]
         right = y[1] + 0.707 * y[2] + 0.5 * y[5] + 0.3548 * y[3]
         return np.stack([left, right], axis=0)
@@ -224,7 +232,6 @@ def downmix_from_separate(file_tuples, sample_rate):
             right, _ = librosa.load(file_tuples[1][0], sr=sample_rate, mono=True)
             min_len = min(len(left), len(right))
             return np.stack([left[:min_len], right[:min_len]], axis=0)
-
     gains = {
         "L": (1.0, 0.0),
         "R": (0.0, 1.0),
@@ -268,7 +275,7 @@ def combine_audio_group(file_list, sample_rate):
         elif len(file_list) == 2:
             label0 = file_list[0][2]
             label1 = file_list[1][2]
-            if (label0 is None and label1 is None) or ({label0, label1} == {"L","R"}):
+            if (label0 is None and label1 is None) or ({label0, label1} == {"L", "R"}):
                 left, _ = librosa.load(file_list[0][0], sr=sample_rate, mono=True)
                 right, _ = librosa.load(file_list[1][0], sr=sample_rate, mono=True)
                 min_len = min(len(left), len(right))
@@ -286,7 +293,9 @@ def combine_audio_group(file_list, sample_rate):
             if y.shape[0] == 6:
                 return downmix_interleaved(y)
             else:
-                print(f"Warning: Unexpected # of channels ({y.shape[0]}) for {path}, downmixing by averaging.")
+                logger.warning(
+                    f"Warning: Unexpected # of channels ({y.shape[0]}) for {path}, downmixing by averaging."
+                )
                 left = np.mean(y[: y.shape[0] // 2], axis=0)
                 right = np.mean(y[y.shape[0] // 2 :], axis=0)
                 return np.stack([left, right], axis=0)
@@ -294,26 +303,48 @@ def combine_audio_group(file_list, sample_rate):
 
 def encode_audio_features(y, sr):
     """
-    Use AudioCraft's EnCodec to encode an audio numpy array.
-    1) Convert to torch tensor
-    2) Resample to 48 kHz and fix channels to match encodec_model
-    3) encodec_model.encode(...) => (codes, scale)
-    4) Flatten codes => np array
+    Use HF AudioCraft EnCodec to encode a stereo numpy array:
+      1) Convert to torch tensor
+      2) Resample to 48k and fix channel count
+      3) Adjust the input length to exactly one chunk (pad or truncate)
+         based on the model's expected chunk length (from config if available, else default 768).
+      4) Encode using EnCodec
+      5) Flatten the resulting codes to a 1D numpy array
     """
     if y is None:
         return None
     audio_tensor = torch.tensor(y, dtype=torch.float32)
     if audio_tensor.ndim == 2:
-        audio_tensor = audio_tensor.unsqueeze(0)  # (1, channels, samples)
+        audio_tensor = audio_tensor.unsqueeze(0)  # shape (1, channels, samples)
 
-    # Convert audio to the model's sample_rate/channels
-    audio_tensor = convert_audio(audio_tensor, src_sr=sr,
-                                 dst_sr=encodec_model.sample_rate,
-                                 dst_channels=encodec_model.channels)
+    # Step 1: Resample + channel fix
+    audio_tensor = convert_audio(
+        audio_tensor,
+        src_sr=sr,
+        dst_sr=encodec_model.sample_rate,
+        dst_channels=encodec_model.channels
+    )
 
+    # Step 2: Get the expected chunk_length from the model's config if available; otherwise use default.
+    if hasattr(encodec_model, "model") and hasattr(encodec_model.model, "config"):
+        config = encodec_model.model.config
+        chunk_length = config.chunk_length
+    else:
+        chunk_length = 768
+
+    L = audio_tensor.shape[-1]
+    if L < chunk_length:
+        pad_needed = chunk_length - L
+        logger.debug(f"Padding audio from {L} to {chunk_length} samples.")
+        audio_tensor = F.pad(audio_tensor, (0, pad_needed))
+    elif L > chunk_length:
+        logger.debug(f"Truncating audio from {L} to {chunk_length} samples.")
+        audio_tensor = audio_tensor[..., :chunk_length]
+
+    # Step 3: Encode with EnCodec (expects a single-chunk input)
     with torch.no_grad():
-        codes, scale = encodec_model.encode(audio_tensor)  # shape [B, K, T]
-    # Usually B=1 => shape (K, T)
+        codes, scale = encodec_model.encode(audio_tensor)  # shape (B, K, T)
+    # For B=1, codes[0] has shape (K, T)
     codes_2d = codes[0]
     codes_flat = codes_2d.flatten()
     return codes_flat.cpu().numpy()
@@ -417,7 +448,9 @@ def expand_instrument_abbrev(name):
             return v
     return normalized
 
-# --- Our custom Batch Manager (for Chat) ---
+# ---------------------------------------------------------------------
+# BatchManager for Chat (OpenAI Batch API)
+# ---------------------------------------------------------------------
 class BatchManager:
     def __init__(self, model="gpt-4"):
         self.model = model
@@ -444,12 +477,10 @@ class BatchManager:
     def execute_batch(self):
         if not self.requests:
             return {}
-
         input_filename = "batch_input.jsonl"
         with open(input_filename, "w", encoding="utf-8") as f:
             for req in self.requests:
                 f.write(json.dumps(req) + "\n")
-
         try:
             upload_resp = client.files.create(
                 file=open(input_filename, "rb"),
@@ -512,23 +543,32 @@ class BatchManager:
                 continue
             content = choices[0]["message"]["content"].strip()
             results[cid] = content
-
         self.requests = []
         return results
 
 global_batch_manager_match = BatchManager(model="gpt-4")
 global_batch_manager_common = BatchManager(model="gpt-4")
-
 pending_cue_data = {}
 
 def queue_match_prompt(batch_manager, track_name, available_groups, cue_id, track_idx):
     custom_id = f"match_{cue_id}_{track_idx}_{track_name.replace(' ', '_')}"
-    user_prompt = (
-        "You must match this MIDI track to one of these audio group names.\n"
-        f"MIDI Track: {track_name}\nAvailable Audio Groups: {', '.join(available_groups)}\n\n"
-        "Output only the exact group name from the above list."
+    # Improved system prompt
+    system_prompt = (
+        "You are an advanced music-production AI with deep knowledge of instruments. "
+        "All track names and group names here refer to some kind of musical instrument—possibly acoustic, electric, digital, or virtual. "
+        "They might contain abbreviations or partial references. Your job is to match the single best audio group from the provided list. "
+        "If multiple groups could match, pick the most precise or relevant one. "
+        "Output only the exact group name from the list and nothing else."
     )
-    system_prompt = "You match MIDI tracks to audio groups from the provided list."
+    user_prompt = (
+        f"MIDI Track: {track_name}\n"
+        f"Available Audio Groups: {', '.join(available_groups)}\n\n"
+        "Instructions:\n"
+        "1) There will be unusual abbreviations or partial references.\n"
+        "2) They always map to real musical instruments.\n"
+        "3) Choose the single best match from the provided Audio Groups.\n"
+        "4) Output only the exact matching group name (no extra text)."
+    )
     batch_manager.queue_chat_request(user_prompt, system_prompt, custom_id)
     return custom_id
 
@@ -537,7 +577,7 @@ def process_cue(cue_dir, sample_rate, project_id):
     midi_dir = os.path.join(cue_dir, "MIDI")
     mid_files = glob.glob(os.path.join(midi_dir, "*.mid"))
     if not mid_files:
-        print(f"No MIDI file in {midi_dir}, skipping.")
+        print(f"No MIDI file found in {midi_dir}, skipping.")
         return
     midi_path = mid_files[0]
     print("Processing MIDI file:", midi_path)
@@ -554,7 +594,7 @@ def process_cue(cue_dir, sample_rate, project_id):
 
     pt_dir = os.path.join(cue_dir, "PT", "Audio Files")
     if not os.path.exists(pt_dir):
-        print(f"No PT/Audio Files dir in {cue_dir}, skipping.")
+        print("Audio Files folder not found; skipping.")
         return
 
     audio_groups = get_audio_file_groups(pt_dir)
@@ -580,7 +620,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         project_id=project_id
     )
 
-    # Final mix
+    # Check final mix
     final_mix_groups = get_audio_file_groups(
         pt_dir,
         keyword_filter=lambda c: "6mx" in c.lower() or "ref" in c.lower()
@@ -642,7 +682,7 @@ def process_cue(cue_dir, sample_rate, project_id):
     for idx, track_name in midi_tracks:
         cid = queue_match_prompt(global_batch_manager_match, track_name, available_groups, cue_id, idx)
         match_requests[cid] = (idx, track_name)
-        print(f"Queued track→group match: {track_name} => custom_id={cid}")
+        print(f"Queued matching prompt for track '{track_name}' -> {cid}")
 
     pending_cue_data[cue_dir] = {
         "cue_id": cue_id,
@@ -653,6 +693,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         "available_groups": available_groups
     }
 
+    # MIDI notes & CC
     mid = mido.MidiFile(midi_path)
     valid_indices = {i for i, _ in midi_tracks}
     for idx, track in enumerate(mid.tracks):
@@ -712,6 +753,7 @@ def process_cue(cue_dir, sample_rate, project_id):
                     tick=ctick,
                     time=evt_time
                 )
+
         grouped_cc = {}
         for e in cc_events:
             key = (e['channel'], e['cc_number'])
@@ -735,76 +777,87 @@ def process_cue(cue_dir, sample_rate, project_id):
                 tick=e['tick'],
                 time=e['time']
             )
-
-    print(f"Finished processing {cue_dir} for Phase 1.")
+    print(f"Finished processing cue: {cue_dir} (Phase 1)")
 
 def finalize_phase_2_3():
     if global_batch_manager_match.requests:
-        print("\nExecuting track->group batch requests...")
-        track_match_results = global_batch_manager_match.execute_batch()
+        print("Executing global batch for MIDI matching...")
+        midi_match_results = global_batch_manager_match.execute_batch()
     else:
-        track_match_results = {}
+        midi_match_results = {}
 
-    print("\nTrack->Group match results:")
-    for k, v in track_match_results.items():
-        print(f"  {k} => {v}")
+    print("MIDI matching results:")
+    for k, v in midi_match_results.items():
+        print(f"  {k}: {v}")
 
     for cue_dir, data in pending_cue_data.items():
         cue_id = data["cue_id"]
-        match_map = {}
-        for custom_id, (idx, track_name) in data["midi_match_requests"].items():
-            pred = track_match_results.get(custom_id, "").strip()
+        match_requests = data["midi_match_requests"]
+        mapping = {}
+        for custom_id, (idx, track_name) in match_requests.items():
+            pred = midi_match_results.get(custom_id, "").strip()
             if not pred:
                 if data["available_groups"]:
                     pred = data["available_groups"][0]
                 else:
                     pred = "UnknownGroup"
-            if pred.lower() not in [g.lower() for g in data["available_groups"]]:
-                best_g, _ = fuzz_process.extractOne(pred, data["available_groups"])
-                pred = best_g
-            match_map[track_name] = pred
-        data["final_mapping"] = match_map
+            # Fuzzy check if response is indeed in the list
+            if pred.lower() not in [grp.lower() for grp in data["available_groups"]]:
+                pred_g, _ = fuzz_process.extractOne(pred, data["available_groups"])
+                pred = pred_g
+            mapping[track_name] = pred
+        data["final_mapping"] = mapping
 
         group_to_tracks = {}
         for idx, track_name in data["midi_tracks"]:
-            assigned_group = match_map.get(track_name)
-            if assigned_group:
-                group_to_tracks.setdefault(assigned_group, []).append(track_name)
+            grp = mapping.get(track_name)
+            if grp:
+                group_to_tracks.setdefault(grp, []).append(track_name)
         data["group_to_tracks"] = group_to_tracks
 
+        # Now queue the "assign common category" requests
         for group_name, track_names in group_to_tracks.items():
             custom_id = f"assign_common_{cue_id}_{group_name}"
-            user_prompt = f"""
-You are given a set of MIDI track names and an audio group identifier.
-MIDI Tracks: **{', '.join(track_names)}**
-Audio Group: **{group_name}**
-Available Categories: **{', '.join(INSTRUMENT_CATEGORIES)}**
-Select the single best category. Output only the exact category name.
-"""
-            system_prompt = "You classify musical instruments into a common category."
+            # Improved system prompt
+            system_prompt = (
+                "You are an advanced music-production AI with deep knowledge of instruments. "
+                "All references here refer to some type of musical instrument, possibly with abbreviations or partial references. "
+                "Your job is to select the single best category from the provided list for these track names. "
+                "Output only the exact category name, nothing else."
+            )
+            user_prompt = (
+                f"MIDI Tracks: **{', '.join(track_names)}**\n"
+                f"Audio Group: **{group_name}**\n"
+                f"Available Categories: **{', '.join(INSTRUMENT_CATEGORIES)}**\n\n"
+                "Instructions:\n"
+                "1) Each name is guaranteed to be a musical instrument (acoustic, electric, digital, or virtual).\n"
+                "2) They might be spelled or abbreviated in unusual ways.\n"
+                "3) Choose the single best category from the list.\n"
+                "4) Output only that category (exact name) and nothing else."
+            )
             global_batch_manager_common.queue_chat_request(user_prompt, system_prompt, custom_id)
             print(f"Queued group->commonCategory prompt for {group_name} => {custom_id}")
 
 def finalize_phase_4():
     if global_batch_manager_common.requests:
-        print("\nExecuting group->commonCategory batch requests...")
+        print("Executing global batch for common category assignment...")
         common_results = global_batch_manager_common.execute_batch()
     else:
         common_results = {}
-
-    print("\nGroup->Category classification results:")
+    print("Common category results:")
     for k, v in common_results.items():
-        print(f"  {k} => {v}")
+        print(f"  {k}: {v}")
 
     for cue_dir, data in pending_cue_data.items():
-        midi_file_rec = data["midi_file_record"]
-        group_to_tracks = data.get("group_to_tracks", {})
+        cue_id = data["cue_id"]
         track_mapping = data.get("final_mapping", {})
+        group_to_tracks = data.get("group_to_tracks", {})
         audio_file_records = data["audio_file_records"]
+        midi_file_record = data["midi_file_record"]
 
         group_common_map = {}
         for group_name, track_names in group_to_tracks.items():
-            custom_id = f"assign_common_{data['cue_id']}_{group_name}"
+            custom_id = f"assign_common_{cue_id}_{group_name}"
             cat = common_results.get(custom_id, "").strip()
             if not cat:
                 cat = "Strings"
@@ -825,13 +878,13 @@ def finalize_phase_4():
                     session.commit()
 
             insert_midi_track(
-                midi_file_id=midi_file_rec.id,
+                midi_file_id=midi_file_record.id,
                 track_index=idx,
                 track_name=track_name,
                 instrument_category=final_cat,
                 assigned_audio_file_id=assigned_audio_id
             )
-            print(f"MIDI track '{track_name}': group='{chosen_group}', cat='{final_cat}' => inserted.")
+            print(f"Inserted MIDI track '{track_name}' => group='{chosen_group}', category='{final_cat}'.")
 
 def main():
     if len(sys.argv) < 2:
@@ -842,7 +895,7 @@ def main():
     try:
         sample_rate = float(sys.argv[2]) if len(sys.argv) >= 3 else 48000
     except ValueError:
-        print("Invalid sample_rate, defaulting to 48000.")
+        print("Invalid sample rate provided. Using default 48000.")
         sample_rate = 48000
 
     if len(sys.argv) >= 4:
@@ -850,25 +903,21 @@ def main():
     else:
         proj = insert_project("Current Project", sample_rate=sample_rate)
         project_id = proj.id
-        print(f"Created a new Project (id={project_id}) at {sample_rate} Hz.")
+        print(f"Created default project with id={project_id} @ {sample_rate} Hz")
 
     cue_dirs = find_cue_directories(base_dir)
     if not cue_dirs:
         print("No cues found under", base_dir)
         sys.exit(0)
-    print(f"Found {len(cue_dirs)} cue dirs. Starting Phase 1...")
 
+    print(f"Found {len(cue_dirs)} cue directories. Beginning Phase 1 processing...")
     for cue in tqdm(cue_dirs, desc="Processing Cues"):
         process_cue(cue, sample_rate, project_id)
+    print("Phase 1 complete. All cues processed.")
 
-    print("\n--- Phase 1 done. Now creating & executing Batch #1 for track->group matches ---")
     finalize_phase_2_3()
-
-    print("\n--- Phase 2 & 3 done. Now creating & executing Batch #2 for group->category classification ---")
     finalize_phase_4()
-
-    print("\nAll done. DB insertion complete!")
-
+    print("All done. DB insertion complete!")
 
 if __name__ == "__main__":
     main()
