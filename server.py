@@ -32,6 +32,7 @@ class Project(Base):
     __tablename__ = "projects"
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=True)
+    sample_rate = Column(Integer, nullable=True)  # New column for sample rate
     midi_files = relationship("MidiFile", back_populates="project")
     audio_files = relationship("AudioFile", back_populates="project")
     final_mixes = relationship("FinalMix", back_populates="project")
@@ -72,7 +73,7 @@ class AudioFeature(Base):
     __tablename__ = "audio_features"
     id = Column(Integer, primary_key=True)
     audio_file_id = Column(Integer, ForeignKey("audio_files.id"))
-    feature_type = Column(String)  # e.g., "mel_spectrogram"
+    feature_type = Column(String)  # e.g., "encoded_audio_tokens"
     feature_data = Column(LargeBinary)    # Stored as binary (npy format)
     audio_file = relationship("AudioFile", back_populates="features")
 
@@ -82,7 +83,7 @@ class FinalMix(Base):
     id = Column(Integer, primary_key=True)
     midi_file_id = Column(Integer, ForeignKey("midi_files.id"), unique=True)
     file_path = Column(String, unique=True)
-    feature_type = Column(String)  # e.g., "mel_spectrogram"
+    feature_type = Column(String)  # e.g., "encoded_audio_tokens"
     feature_data = Column(LargeBinary)    # Stored as binary (npy format)
     cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
@@ -145,15 +146,13 @@ class MidiProgramChange(Base):
     midi_track = relationship("MidiTrack", back_populates="program_changes")
 
 # --- Database Configuration ---
-DATABASE_URL = os.getenv("DATABASE_URL")  # Read from the .env file.
+DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 Session = sessionmaker(bind=engine)
 session = Session()
 
-
 def init_db():
     Base.metadata.create_all(engine)
-
 
 def insert_cue_group(cue_path):
     cue_group = CueGroup(cue_path=cue_path)
@@ -161,17 +160,14 @@ def insert_cue_group(cue_path):
     session.commit()
     return cue_group
 
-
 def get_cue_group_by_path(cue_path):
     return session.query(CueGroup).filter_by(cue_path=cue_path).first()
 
-
-def insert_project(name):
-    project = Project(name=name)
+def insert_project(name, sample_rate=None):
+    project = Project(name=name, sample_rate=sample_rate)
     session.add(project)
     session.commit()
     return project
-
 
 def insert_midi_file(file_path, tempo_map, time_signature_map, ticks_per_beat, cue_group_id=None, project_id=None):
     record = MidiFile(
@@ -186,7 +182,6 @@ def insert_midi_file(file_path, tempo_map, time_signature_map, ticks_per_beat, c
     session.commit()
     return record
 
-
 def insert_audio_file(file_path, canonical_name, instrument_category, cue_group_id=None, project_id=None):
     record = AudioFile(
         file_path=file_path,
@@ -199,7 +194,6 @@ def insert_audio_file(file_path, canonical_name, instrument_category, cue_group_
     session.commit()
     return record
 
-
 def insert_audio_feature(audio_file_id, feature_type, feature_data):
     record = AudioFeature(
         audio_file_id=audio_file_id,
@@ -209,7 +203,6 @@ def insert_audio_feature(audio_file_id, feature_type, feature_data):
     session.add(record)
     session.commit()
     return record
-
 
 def insert_final_mix(midi_file_id, file_path, feature_type, feature_data, cue_group_id=None, project_id=None):
     record = FinalMix(
@@ -224,7 +217,6 @@ def insert_final_mix(midi_file_id, file_path, feature_type, feature_data, cue_gr
     session.commit()
     return record
 
-
 def insert_midi_track(midi_file_id, track_index, track_name, instrument_category, assigned_audio_file_id):
     record = MidiTrack(
         midi_file_id=midi_file_id,
@@ -236,7 +228,6 @@ def insert_midi_track(midi_file_id, track_index, track_name, instrument_category
     session.add(record)
     session.commit()
     return record
-
 
 def insert_midi_note(midi_track_id, channel, note, velocity, start_tick, end_tick, start_time, duration):
     record = MidiNote(
@@ -253,7 +244,6 @@ def insert_midi_note(midi_track_id, channel, note, velocity, start_tick, end_tic
     session.commit()
     return record
 
-
 def insert_midi_cc(midi_track_id, channel, cc_number, cc_value, tick, time):
     record = MidiCC(
         midi_track_id=midi_track_id,
@@ -266,7 +256,6 @@ def insert_midi_cc(midi_track_id, channel, cc_number, cc_value, tick, time):
     session.add(record)
     session.commit()
     return record
-
 
 def insert_midi_program_change(midi_track_id, channel, program, tick, time):
     record = MidiProgramChange(
