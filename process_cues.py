@@ -5,7 +5,7 @@ process_cues.py
 This script recursively scans a base cues directory for projects (each cue folder must contain a "MIDI"
 subfolder with .mid file(s) and a "PT/Audio Files" subfolder). It processes the MIDI and audio files,
 tokenizes the audio using EnCodec for MusicGen (the 48 kHz AudioCraft model, from transformers),
-and uses the OpenAI Batch API to do the classification (track->group + common category) asynchronously.
+and uses the OpenAI Batch API to do the classification (track→group + common category) asynchronously.
 
 Finally, once a MIDI track is matched to an audio group and we have a final "common instrument category,"
 we update both:
@@ -23,7 +23,8 @@ import json
 import io
 import re
 import time
-import logging  # <-- For optional debug logging
+import logging  # For optional debug logging
+import requests  # For file download
 
 # Third-Party Packages
 import mido
@@ -39,7 +40,7 @@ from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env
 
 # ---------------------------------------------------------------------
-# Setup Logging (Optional)
+# Setup Logging
 # ---------------------------------------------------------------------
 logging.basicConfig(
     stream=sys.stderr,
@@ -52,6 +53,7 @@ logger = logging.getLogger(__name__)
 # OpenAI Batch API Setup
 # ---------------------------------------------------------------------
 from openai import OpenAI
+import openai  # needed for the new interface
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 if client.api_key is None:
@@ -59,20 +61,26 @@ if client.api_key is None:
     sys.exit(1)
 
 # ---------------------------------------------------------------------
+# Helper to download file content using requests
+# ---------------------------------------------------------------------
+def download_output_file(file_id):
+    headers = {"Authorization": f"Bearer {client.api_key}"}
+    url = f"https://api.openai.com/v1/files/{file_id}/content"
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    return response.content
+
+# ---------------------------------------------------------------------
 # AudioCraft EnCodec 48 kHz from transformers
 # ---------------------------------------------------------------------
 from audiocraft.models.encodec import CompressionModel
-
+ 
 def convert_audio(audio_tensor: torch.Tensor, src_sr: int, dst_sr: int, dst_channels: int):
     """
-    A utility to:
-      1) Resample from src_sr to dst_sr using torchaudio
-      2) Convert channel count if needed
-    audio_tensor shape = (batch_size, channels, num_samples)
+    Resample from src_sr to dst_sr using torchaudio and adjust channel count if needed.
     """
     if src_sr != dst_sr:
         audio_tensor = torchaudio.functional.resample(audio_tensor, src_sr, dst_sr)
-
     cur_channels = audio_tensor.shape[1]
     if cur_channels != dst_channels:
         if dst_channels == 1:
@@ -80,18 +88,14 @@ def convert_audio(audio_tensor: torch.Tensor, src_sr: int, dst_sr: int, dst_chan
         elif dst_channels == 2 and cur_channels == 1:
             audio_tensor = audio_tensor.repeat(1, 2, 1)
         else:
-            logger.warning(
-                f"Cannot automatically convert from {cur_channels} channels to {dst_channels} channels."
-            )
+            logger.warning(f"Cannot convert from {cur_channels} to {dst_channels} channels.")
     return audio_tensor
 
 # Load the 48 kHz model
 global encodec_model
 encodec_model = CompressionModel.get_pretrained("facebook/encodec_48khz")
 encodec_model.eval()
-
 logger.info("Loaded AudioCraft EnCodec 48k model.")
-# (Note: Some versions do not expose a .config attribute directly.)
 
 # ---------------------------------------------------------------------
 # Global Configuration & Constants
@@ -215,7 +219,6 @@ def downmix_interleaved(y):
     if y.shape[0] < 2:
         return y
     if y.shape[0] == 6:
-        # 5.1 -> stereo
         left = y[0] + 0.707 * y[2] + 0.5 * y[4] + 0.3548 * y[3]
         right = y[1] + 0.707 * y[2] + 0.5 * y[5] + 0.3548 * y[3]
         return np.stack([left, right], axis=0)
@@ -293,9 +296,7 @@ def combine_audio_group(file_list, sample_rate):
             if y.shape[0] == 6:
                 return downmix_interleaved(y)
             else:
-                logger.warning(
-                    f"Warning: Unexpected # of channels ({y.shape[0]}) for {path}, downmixing by averaging."
-                )
+                logger.warning(f"Unexpected # of channels ({y.shape[0]}) for {path}, downmixing by averaging.")
                 left = np.mean(y[: y.shape[0] // 2], axis=0)
                 right = np.mean(y[y.shape[0] // 2 :], axis=0)
                 return np.stack([left, right], axis=0)
@@ -303,35 +304,28 @@ def combine_audio_group(file_list, sample_rate):
 
 def encode_audio_features(y, sr):
     """
-    Use HF AudioCraft EnCodec to encode a stereo numpy array:
-      1) Convert to torch tensor
-      2) Resample to 48k and fix channel count
-      3) Adjust the input length to exactly one chunk (pad or truncate)
-         based on the model's expected chunk length (from config if available, else default 768).
-      4) Encode using EnCodec
-      5) Flatten the resulting codes to a 1D numpy array
+    Encode a stereo numpy array using AudioCraft EnCodec:
+      1) Convert to a torch tensor.
+      2) Resample to 48k and adjust channels.
+      3) Pad or truncate to the model's expected chunk length.
+      4) Encode and flatten the output.
     """
     if y is None:
         return None
     audio_tensor = torch.tensor(y, dtype=torch.float32)
     if audio_tensor.ndim == 2:
-        audio_tensor = audio_tensor.unsqueeze(0)  # shape (1, channels, samples)
-
-    # Step 1: Resample + channel fix
+        audio_tensor = audio_tensor.unsqueeze(0)
     audio_tensor = convert_audio(
         audio_tensor,
         src_sr=sr,
         dst_sr=encodec_model.sample_rate,
         dst_channels=encodec_model.channels
     )
-
-    # Step 2: Get the expected chunk_length from the model's config if available; otherwise use default.
     if hasattr(encodec_model, "model") and hasattr(encodec_model.model, "config"):
         config = encodec_model.model.config
         chunk_length = config.chunk_length
     else:
         chunk_length = 768
-
     L = audio_tensor.shape[-1]
     if L < chunk_length:
         pad_needed = chunk_length - L
@@ -340,13 +334,9 @@ def encode_audio_features(y, sr):
     elif L > chunk_length:
         logger.debug(f"Truncating audio from {L} to {chunk_length} samples.")
         audio_tensor = audio_tensor[..., :chunk_length]
-
-    # Step 3: Encode with EnCodec (expects a single-chunk input)
     with torch.no_grad():
-        codes, scale = encodec_model.encode(audio_tensor)  # shape (B, K, T)
-    # For B=1, codes[0] has shape (K, T)
-    codes_2d = codes[0]
-    codes_flat = codes_2d.flatten()
+        codes, scale = encodec_model.encode(audio_tensor)
+    codes_flat = codes[0].flatten()
     return codes_flat.cpu().numpy()
 
 def serialize_feature_array(feature_array):
@@ -397,14 +387,12 @@ def extract_tempo_and_time_signature(midi_path):
         print(f"Error opening MIDI file: {e}")
         sys.exit(1)
     ticks_per_beat = mid.ticks_per_beat
-
     merged = mido.merge_tracks(mid.tracks)
     current_tempo = 500000
     abs_time = 0.0
     abs_ticks = 0
     tempo_map = []
     time_sig_map = []
-
     for msg in merged:
         abs_ticks += msg.time
         delta_sec = mido.tick2second(msg.time, ticks_per_beat, current_tempo)
@@ -415,7 +403,6 @@ def extract_tempo_and_time_signature(midi_path):
                 tempo_map.append((abs_time, abs_ticks, msg.tempo))
         elif msg.type == "time_signature":
             time_sig_map.append((abs_time, abs_ticks, msg.numerator, msg.denominator))
-
     if not tempo_map or tempo_map[0][1] > 0:
         tempo_map.insert(0, (0.0, 0, 500000))
     if not time_sig_map or time_sig_map[0][1] > 0:
@@ -457,6 +444,16 @@ class BatchManager:
         self.requests = []
 
     def queue_chat_request(self, user_prompt, system_prompt, custom_id):
+        """
+        Ensures each request stays under token limits.
+        """
+        MAX_REQUEST_TOKENS = 3500  # Safe limit for GPT-4
+        estimated_user_tokens = len(user_prompt) // 4
+        estimated_system_tokens = len(system_prompt) // 4
+        total_estimated = estimated_user_tokens + estimated_system_tokens
+        if total_estimated > MAX_REQUEST_TOKENS:
+            logger.warning(f"Request {custom_id} is too large ({total_estimated} tokens). Truncating user prompt.")
+            user_prompt = user_prompt[:MAX_REQUEST_TOKENS * 4]  # Trim down text
         body = {
             "model": self.model,
             "messages": [
@@ -464,7 +461,7 @@ class BatchManager:
                 {"role": "user", "content": user_prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 40
+            "max_tokens": 20  # Keep response small
         }
         request_line = {
             "custom_id": custom_id,
@@ -473,69 +470,67 @@ class BatchManager:
             "body": body
         }
         self.requests.append(request_line)
+        logger.info(f"Queued request '{custom_id}' with estimated tokens={total_estimated}.")
 
-    def execute_batch(self):
-        if not self.requests:
-            return {}
-        input_filename = "batch_input.jsonl"
-        with open(input_filename, "w", encoding="utf-8") as f:
-            for req in self.requests:
+    def _process_batch(self, batch):
+        results = {}
+        # Write the current batch to a temporary JSONL file
+        temp_filename = f"batch_input_{int(time.time()*1000)}.jsonl"
+        with open(temp_filename, "w", encoding="utf-8") as f:
+            for req in batch:
                 f.write(json.dumps(req) + "\n")
         try:
             upload_resp = client.files.create(
-                file=open(input_filename, "rb"),
+                file=open(temp_filename, "rb"),
                 purpose="batch"
             )
         except Exception as e:
-            print("Error uploading batch file:", e)
+            logger.error(f"Error uploading batch file {temp_filename}: {e}")
             sys.exit(1)
         input_file_id = upload_resp.id
-
         try:
-            batch = client.batches.create(
+            batch_obj = client.batches.create(
                 input_file_id=input_file_id,
                 endpoint="/v1/chat/completions",
                 completion_window="24h"
             )
         except Exception as e:
-            print("Error creating batch:", e)
+            logger.error(f"Error creating batch for {temp_filename}: {e}")
             sys.exit(1)
-
-        batch_id = batch.id
-        print(f"[BatchManager] Created batch {batch_id}. Waiting for completion...")
-
+        batch_id = batch_obj.id
+        logger.info(f"[BatchManager] Created batch {batch_id} for file {temp_filename}. Waiting for completion...")
         while True:
             status_obj = client.batches.retrieve(batch_id)
             status = status_obj.status
             if status == "completed":
+                logger.info(f"Batch {batch_id} complete. Waiting an extra 30 seconds before proceeding for safety...")
+                time.sleep(30)
                 break
             elif status in ["failed", "expired"]:
-                print(f"Batch {batch_id} ended with status={status}")
+                logger.error(f"Batch {batch_id} ended with status={status}")
+                logger.error(f"Error details: {status_obj}")
                 sys.exit(1)
             elif status in ["cancelling", "cancelled"]:
-                print(f"Batch {batch_id} was cancelled. Exiting.")
+                logger.error(f"Batch {batch_id} was cancelled. Exiting.")
                 sys.exit(1)
             else:
-                print(f"  batch status = {status}, waiting 10s...")
+                logger.info(f"  Batch {batch_id} status = {status}, waiting 10s...")
                 time.sleep(10)
-
         output_file_id = status_obj.output_file_id
         if not output_file_id:
-            print("No output_file_id found. Possibly no lines succeeded. Exiting.")
+            logger.error("No output_file_id found. Exiting.")
             sys.exit(1)
-
         try:
-            output_resp = client.files.download(output_file_id)
+            output_resp = download_output_file(output_file_id)
         except Exception as e:
-            print("Error downloading output file:", e)
+            logger.error(f"Error downloading output for batch {batch_id}: {e}")
             sys.exit(1)
-
-        results = {}
         for line in output_resp.decode("utf-8").splitlines():
             rec = json.loads(line)
             cid = rec["custom_id"]
             if rec["error"] is not None:
-                results[cid] = ""
+                results[cid] = f"Error: {rec['error']}"
+                logger.error(f"Custom_id '{cid}' error: {rec['error']}")
                 continue
             choices = rec["response"]["body"].get("choices", [])
             if not choices:
@@ -543,31 +538,78 @@ class BatchManager:
                 continue
             content = choices[0]["message"]["content"].strip()
             results[cid] = content
+            usage = rec["response"]["body"].get("usage")
+            if usage:
+                logger.info(f"Token usage for '{cid}': prompt={usage.get('prompt_tokens',0)}, "
+                            f"completion={usage.get('completion_tokens',0)}, total={usage.get('total_tokens',0)}")
+        return results
+
+    def execute_batches(self, max_requests_per_batch=60, max_tokens_per_batch=3500):
+        """
+        Splits queued requests into batches ensuring token limits are not exceeded.
+        """
+        results = {}
+        if not self.requests:
+            return results
+
+        current_batch = []
+        current_token_count = 0
+
+        for req in self.requests:
+            body = req["body"]
+            estimated_tokens = len(json.dumps(body)) // 4  # Rough token estimate
+            if len(current_batch) >= max_requests_per_batch or (current_token_count + estimated_tokens) > max_tokens_per_batch:
+                results.update(self._process_batch(current_batch))
+                current_batch = []
+                current_token_count = 0
+            current_batch.append(req)
+            current_token_count += estimated_tokens
+
+        if current_batch:
+            results.update(self._process_batch(current_batch))
         self.requests = []
         return results
 
+    def execute_batches_parallel(self, max_workers=4):
+        """
+        Processes batches in parallel to improve throughput.
+        """
+        results = {}
+        if not self.requests:
+            return results
+
+        total_requests = len(self.requests)
+        batch_size = max(1, total_requests // max_workers)
+        batches = [self.requests[i:i+batch_size] for i in range(0, total_requests, batch_size)]
+
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(self._process_batch, batch): batch for batch in batches}
+            for future in futures:
+                try:
+                    results.update(future.result())
+                except Exception as e:
+                    logger.error(f"Batch processing error: {e}")
+        self.requests = []
+        return results
+
+# Global BatchManagers and pending cue data storage
 global_batch_manager_match = BatchManager(model="gpt-4")
 global_batch_manager_common = BatchManager(model="gpt-4")
 pending_cue_data = {}
 
 def queue_match_prompt(batch_manager, track_name, available_groups, cue_id, track_idx):
     custom_id = f"match_{cue_id}_{track_idx}_{track_name.replace(' ', '_')}"
-    # Improved system prompt
+    # System prompt for matching
     system_prompt = (
-        "You are an advanced music-production AI with deep knowledge of instruments. "
-        "All track names and group names here refer to some kind of musical instrument—possibly acoustic, electric, digital, or virtual. "
-        "They might contain abbreviations or partial references. Your job is to match the single best audio group from the provided list. "
-        "If multiple groups could match, pick the most precise or relevant one. "
-        "Output only the exact group name from the list and nothing else."
+        "You are an expert music-production AI. Given a MIDI track name and a list of audio groups, "
+        "select the best matching group considering abstract meanings and abbreviations. Output only the group name."
     )
+    # User prompt for matching
     user_prompt = (
         f"MIDI Track: {track_name}\n"
-        f"Available Audio Groups: {', '.join(available_groups)}\n\n"
-        "Instructions:\n"
-        "1) There will be unusual abbreviations or partial references.\n"
-        "2) They always map to real musical instruments.\n"
-        "3) Choose the single best match from the provided Audio Groups.\n"
-        "4) Output only the exact matching group name (no extra text)."
+        f"Audio Groups: {', '.join(available_groups)}\n"
+        "Select the best matching group."
     )
     batch_manager.queue_chat_request(user_prompt, system_prompt, custom_id)
     return custom_id
@@ -581,22 +623,18 @@ def process_cue(cue_dir, sample_rate, project_id):
         return
     midi_path = mid_files[0]
     print("Processing MIDI file:", midi_path)
-
     from server import MidiFile
     existing = session.query(MidiFile).filter_by(file_path=midi_path).first()
     if existing:
-        print(f"MIDI file {midi_path} is already processed. Skipping.")
+        print(f"MIDI file {midi_path} already processed. Skipping.")
         return
-
     cue_group_id = get_or_create_cue_group(cue_dir)
     tempo_map, time_sig_map, tpb = extract_tempo_and_time_signature(midi_path)
     midi_tracks = extract_midi_track_names(midi_path)
-
     pt_dir = os.path.join(cue_dir, "PT", "Audio Files")
     if not os.path.exists(pt_dir):
         print("Audio Files folder not found; skipping.")
         return
-
     audio_groups = get_audio_file_groups(pt_dir)
     composite_audio = {}
     print("Combining/downmix audio in", pt_dir)
@@ -604,13 +642,11 @@ def process_cue(cue_dir, sample_rate, project_id):
         wave_stereo = combine_audio_group(file_tuples, sample_rate)
         if wave_stereo is not None:
             composite_audio[canonical] = wave_stereo
-
     print("Encoding audio with EnCodec...")
     audio_features = {}
     for canonical, wave_stereo in tqdm(composite_audio.items(), desc="Tokenizing", leave=False):
         tokens = encode_audio_features(wave_stereo, int(sample_rate))
         audio_features[canonical] = serialize_feature_array(tokens)
-
     midi_file_record = insert_midi_file(
         file_path=midi_path,
         tempo_map=json.dumps(tempo_map),
@@ -619,7 +655,6 @@ def process_cue(cue_dir, sample_rate, project_id):
         cue_group_id=cue_group_id,
         project_id=project_id
     )
-
     # Check final mix
     final_mix_groups = get_audio_file_groups(
         pt_dir,
@@ -642,8 +677,7 @@ def process_cue(cue_dir, sample_rate, project_id):
                     project_id=project_id
                 )
     else:
-        print("No final mix (6mx/ref) found in", pt_dir)
-
+        print("No final mix found in", pt_dir)
     audio_file_records = {}
     for canonical, file_tuples in audio_groups.items():
         rep = file_tuples[0] if isinstance(file_tuples[0], tuple) else (file_tuples[0], None, None)
@@ -653,7 +687,6 @@ def process_cue(cue_dir, sample_rate, project_id):
         if not best_match:
             best_match = "Strings"
         audio_cat = best_match
-
         exist_aud = session.query(AudioFile).filter_by(file_path=full_path).first()
         if exist_aud:
             print(f"Audio file {full_path} in DB, skipping.")
@@ -667,7 +700,6 @@ def process_cue(cue_dir, sample_rate, project_id):
                 project_id=project_id
             )
             rec_id = rec.id
-
         audio_file_records[canonical] = rec_id
         if canonical in audio_features and audio_features[canonical] is not None:
             insert_audio_feature(
@@ -675,7 +707,6 @@ def process_cue(cue_dir, sample_rate, project_id):
                 feature_type="encoded_audio_tokens",
                 feature_data=audio_features[canonical]
             )
-
     available_groups = list(audio_groups.keys())
     cue_id = os.path.basename(cue_dir)
     match_requests = {}
@@ -683,7 +714,6 @@ def process_cue(cue_dir, sample_rate, project_id):
         cid = queue_match_prompt(global_batch_manager_match, track_name, available_groups, cue_id, idx)
         match_requests[cid] = (idx, track_name)
         print(f"Queued matching prompt for track '{track_name}' -> {cid}")
-
     pending_cue_data[cue_dir] = {
         "cue_id": cue_id,
         "midi_file_record": midi_file_record,
@@ -692,8 +722,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         "audio_file_records": audio_file_records,
         "available_groups": available_groups
     }
-
-    # MIDI notes & CC
+    # Process MIDI notes & CC
     mid = mido.MidiFile(midi_path)
     valid_indices = {i for i, _ in midi_tracks}
     for idx, track in enumerate(mid.tracks):
@@ -705,7 +734,6 @@ def process_cue(cue_dir, sample_rate, project_id):
         for msg in tqdm(track, desc=f"MIDI events track {idx}", leave=False):
             ctick += msg.time
             evt_time = tick_to_time(ctick, tempo_map, tpb)
-
             if msg.type == "note_on":
                 if msg.velocity > 0:
                     pending_notes[(msg.channel, msg.note)] = (ctick, evt_time, msg.velocity)
@@ -753,20 +781,18 @@ def process_cue(cue_dir, sample_rate, project_id):
                     tick=ctick,
                     time=evt_time
                 )
-
         grouped_cc = {}
         for e in cc_events:
             key = (e['channel'], e['cc_number'])
             grouped_cc.setdefault(key, []).append(e)
         final_cc = []
         for key, group_evs in grouped_cc.items():
-            if key[1] in [1, 11]:  # mod or expression
+            if key[1] in [1, 11]:
                 sorted_evs = sorted(group_evs, key=lambda x: x['tick'])
                 thinned = thin_midi_cc_events(sorted_evs, tolerance=1, max_interval=0.05)
             else:
                 thinned = group_evs
             final_cc.extend(thinned)
-
         final_cc.sort(key=lambda x: x['tick'])
         for e in final_cc:
             insert_midi_cc(
@@ -780,16 +806,15 @@ def process_cue(cue_dir, sample_rate, project_id):
     print(f"Finished processing cue: {cue_dir} (Phase 1)")
 
 def finalize_phase_2_3():
+    # Execute the matching batch for MIDI tracks.
     if global_batch_manager_match.requests:
         print("Executing global batch for MIDI matching...")
-        midi_match_results = global_batch_manager_match.execute_batch()
+        midi_match_results = global_batch_manager_match.execute_batches(max_requests_per_batch=60, max_tokens_per_batch=3500)
     else:
         midi_match_results = {}
-
     print("MIDI matching results:")
     for k, v in midi_match_results.items():
         print(f"  {k}: {v}")
-
     for cue_dir, data in pending_cue_data.items():
         cue_id = data["cue_id"]
         match_requests = data["midi_match_requests"]
@@ -801,39 +826,30 @@ def finalize_phase_2_3():
                     pred = data["available_groups"][0]
                 else:
                     pred = "UnknownGroup"
-            # Fuzzy check if response is indeed in the list
             if pred.lower() not in [grp.lower() for grp in data["available_groups"]]:
                 pred_g, _ = fuzz_process.extractOne(pred, data["available_groups"])
                 pred = pred_g
             mapping[track_name] = pred
         data["final_mapping"] = mapping
-
         group_to_tracks = {}
         for idx, track_name in data["midi_tracks"]:
             grp = mapping.get(track_name)
             if grp:
                 group_to_tracks.setdefault(grp, []).append(track_name)
         data["group_to_tracks"] = group_to_tracks
-
-        # Now queue the "assign common category" requests
         for group_name, track_names in group_to_tracks.items():
             custom_id = f"assign_common_{cue_id}_{group_name}"
-            # Improved system prompt
+            # System prompt for common category assignment
             system_prompt = (
-                "You are an advanced music-production AI with deep knowledge of instruments. "
-                "All references here refer to some type of musical instrument, possibly with abbreviations or partial references. "
-                "Your job is to select the single best category from the provided list for these track names. "
-                "Output only the exact category name, nothing else."
+                "You are an expert music-production AI. Given MIDI track names and an audio group, "
+                "select the best category from the provided list. MIDI and audio names might be abstract or abbreviated, "
+                "Output only the category name."
             )
             user_prompt = (
-                f"MIDI Tracks: **{', '.join(track_names)}**\n"
-                f"Audio Group: **{group_name}**\n"
-                f"Available Categories: **{', '.join(INSTRUMENT_CATEGORIES)}**\n\n"
-                "Instructions:\n"
-                "1) Each name is guaranteed to be a musical instrument (acoustic, electric, digital, or virtual).\n"
-                "2) They might be spelled or abbreviated in unusual ways.\n"
-                "3) Choose the single best category from the list.\n"
-                "4) Output only that category (exact name) and nothing else."
+                f"MIDI Tracks: {', '.join(track_names)}\n"
+                f"Audio Group: {group_name}\n"
+                f"Categories: {', '.join(INSTRUMENT_CATEGORIES)}\n"
+                "Select the best category."
             )
             global_batch_manager_common.queue_chat_request(user_prompt, system_prompt, custom_id)
             print(f"Queued group->commonCategory prompt for {group_name} => {custom_id}")
@@ -841,20 +857,18 @@ def finalize_phase_2_3():
 def finalize_phase_4():
     if global_batch_manager_common.requests:
         print("Executing global batch for common category assignment...")
-        common_results = global_batch_manager_common.execute_batch()
+        common_results = global_batch_manager_common.execute_batches(max_requests_per_batch=60, max_tokens_per_batch=3500)
     else:
         common_results = {}
     print("Common category results:")
     for k, v in common_results.items():
         print(f"  {k}: {v}")
-
     for cue_dir, data in pending_cue_data.items():
         cue_id = data["cue_id"]
         track_mapping = data.get("final_mapping", {})
         group_to_tracks = data.get("group_to_tracks", {})
         audio_file_records = data["audio_file_records"]
         midi_file_record = data["midi_file_record"]
-
         group_common_map = {}
         for group_name, track_names in group_to_tracks.items():
             custom_id = f"assign_common_{cue_id}_{group_name}"
@@ -862,21 +876,17 @@ def finalize_phase_4():
             if not cat:
                 cat = "Strings"
             group_common_map[group_name] = cat
-
         for idx, track_name in data["midi_tracks"]:
             chosen_group = track_mapping.get(track_name)
             assigned_audio_id = None
             if chosen_group in audio_file_records:
                 assigned_audio_id = audio_file_records[chosen_group]
-
             final_cat = group_common_map.get(chosen_group, "Strings")
-
             if assigned_audio_id is not None:
                 audio_file_obj = session.query(AudioFile).filter_by(id=assigned_audio_id).first()
                 if audio_file_obj:
                     audio_file_obj.instrument_category = final_cat
                     session.commit()
-
             insert_midi_track(
                 midi_file_id=midi_file_record.id,
                 track_index=idx,
@@ -890,31 +900,26 @@ def main():
     if len(sys.argv) < 2:
         print("Usage: python process_cues.py <cue_base_directory> [sample_rate] [project_id]")
         sys.exit(1)
-
     base_dir = sys.argv[1]
     try:
         sample_rate = float(sys.argv[2]) if len(sys.argv) >= 3 else 48000
     except ValueError:
         print("Invalid sample rate provided. Using default 48000.")
         sample_rate = 48000
-
     if len(sys.argv) >= 4:
         project_id = int(sys.argv[3])
     else:
         proj = insert_project("Current Project", sample_rate=sample_rate)
         project_id = proj.id
         print(f"Created default project with id={project_id} @ {sample_rate} Hz")
-
     cue_dirs = find_cue_directories(base_dir)
     if not cue_dirs:
         print("No cues found under", base_dir)
         sys.exit(0)
-
     print(f"Found {len(cue_dirs)} cue directories. Beginning Phase 1 processing...")
     for cue in tqdm(cue_dirs, desc="Processing Cues"):
         process_cue(cue, sample_rate, project_id)
     print("Phase 1 complete. All cues processed.")
-
     finalize_phase_2_3()
     finalize_phase_4()
     print("All done. DB insertion complete!")
