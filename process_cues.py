@@ -523,7 +523,7 @@ class BatchManager:
         """
         Ensures each request stays under token limits.
         """
-        MAX_REQUEST_TOKENS = 10000  # Safe limit for GPT-4
+        MAX_REQUEST_TOKENS = 10000  # Safe limit for gpt-4o
         estimated_user_tokens = self._count_tokens(user_prompt)
         estimated_system_tokens = self._count_tokens(system_prompt)
         total_estimated = estimated_user_tokens + estimated_system_tokens
@@ -687,8 +687,8 @@ class BatchManager:
         return results
 
 # Global BatchManagers and pending cue data storage
-global_batch_manager_match = BatchManager(model="gpt-4")
-global_batch_manager_common = BatchManager(model="gpt-4")
+global_batch_manager_match = BatchManager(model="gpt-4o")
+global_batch_manager_common = BatchManager(model="gpt-4o")
 pending_cue_data = {}
 
 def queue_match_prompt(batch_manager, track_name, available_groups_trimmed, cue_id, track_idx):
