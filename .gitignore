@@ -21,3 +21,5 @@ __pycache__/
 
 batch_input.jsonl
 token_count.py
+
+batch-input
