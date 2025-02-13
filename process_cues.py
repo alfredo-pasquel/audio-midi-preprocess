@@ -499,9 +499,9 @@ import tiktoken
 
 class BatchManager:
 
-    MAX_PENDING_TOKENS = 50000
+    MAX_PENDING_TOKENS = 250000
 
-    def __init__(self, model="gpt-4"):
+    def __init__(self, model="gpt-4o"):
         self.model = model
         self.requests = []
         # Initialize tiktoken encoding for this model
@@ -523,7 +523,7 @@ class BatchManager:
         """
         Ensures each request stays under token limits.
         """
-        MAX_REQUEST_TOKENS = 2800  # Safe limit for GPT-4
+        MAX_REQUEST_TOKENS = 10000  # Safe limit for GPT-4
         estimated_user_tokens = self._count_tokens(user_prompt)
         estimated_system_tokens = self._count_tokens(system_prompt)
         total_estimated = estimated_user_tokens + estimated_system_tokens
@@ -558,12 +558,15 @@ class BatchManager:
         if current_total > self.MAX_PENDING_TOKENS:
             logger.info(f"Pending tokens ({current_total}) exceed threshold, executing batches...")
             # Use reduced max_tokens_per_batch as desired (2800 in this case)
-            self.execute_batches(max_requests_per_batch=4, max_tokens_per_batch=2800)
+            self.execute_batches(max_requests_per_batch=12, max_tokens_per_batch=4000)
 
     def _process_batch(self, batch):
         results = {}
-        # Write the current batch to a temporary JSONL file
-        temp_filename = f"batch_input_{int(time.time()*1000)}.jsonl"
+        BATCH_INPUT_DIR = "batch-input"
+        if not os.path.exists(BATCH_INPUT_DIR):
+            os.makedirs(BATCH_INPUT_DIR)
+        # Create the temporary JSONL file path within the batch-input folder
+        temp_filename = os.path.join(BATCH_INPUT_DIR, f"batch_input_{int(time.time()*1000)}.jsonl")
         with open(temp_filename, "w", encoding="utf-8") as f:
             for req in batch:
                 f.write(json.dumps(req) + "\n")
@@ -592,7 +595,7 @@ class BatchManager:
             status = status_obj.status
             if status == "completed":
                 logger.info(f"Batch {batch_id} complete. Waiting an extra 30 seconds before proceeding for safety...")
-                time.sleep(30)
+                time.sleep(10)
                 break
             elif status in ["failed", "expired"]:
                 logger.error(f"Batch {batch_id} ended with status={status}")
@@ -632,10 +635,10 @@ class BatchManager:
                             f"completion={usage.get('completion_tokens',0)}, total={usage.get('total_tokens',0)}")
         return results
 
-    def execute_batches(self, max_requests_per_batch=4, max_tokens_per_batch=2800):
+    def execute_batches(self, max_requests_per_batch=12, max_tokens_per_batch=4000):
         """
         Splits queued requests into batches ensuring token limits are not exceeded.
-        Note: When called via the throttle in queue_chat_request, max_tokens_per_batch should be set to 2800.
+        Note: When called via the throttle in queue_chat_request, max_tokens_per_batch should be set to 4000.
         """
         results = {}
         if not self.requests:
@@ -911,7 +914,7 @@ def finalize_phase_2_3():
     # Execute the matching batch for MIDI tracks.
     if global_batch_manager_match.requests:
         print("Executing global batch for MIDI matching...")
-        midi_match_results = global_batch_manager_match.execute_batches(max_requests_per_batch=4, max_tokens_per_batch=2800)
+        midi_match_results = global_batch_manager_match.execute_batches(max_requests_per_batch=12, max_tokens_per_batch=4000)
     else:
         midi_match_results = {}
     print("MIDI matching results:")
@@ -958,7 +961,7 @@ def finalize_phase_2_3():
 def finalize_phase_4():
     if global_batch_manager_common.requests:
         print("Executing global batch for common category assignment...")
-        common_results = global_batch_manager_common.execute_batches(max_requests_per_batch=4, max_tokens_per_batch=2800)
+        common_results = global_batch_manager_common.execute_batches(max_requests_per_batch=12, max_tokens_per_batch=4000)
     else:
         common_results = {}
     print("Common category results:")
