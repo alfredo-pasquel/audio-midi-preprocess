@@ -39,7 +39,7 @@ The Audio-MIDI Preprocessing Tool processes cue directories (each containing a `
 - Extracting mel-spectrogram features from both instrument groups and the final mix (e.g. files containing `6MX` or `REF` in their name).
 
 ### Mapping & Feature Extraction:
-- Using OpenAI’s gpt-4o API to match MIDI tracks to audio groups based on abstract naming relationships.
+- Using OpenAI’s gpt-4oo API to match MIDI tracks to audio groups based on abstract naming relationships.
 - Assigning instrument categories (from a fixed list) to both MIDI tracks and audio groups.
 - Thinning out redundant MIDI control change events (especially for expression (CC 11) and modulation (CC 1)).
 
@@ -56,7 +56,7 @@ The Audio-MIDI Preprocessing Tool processes cue directories (each containing a `
 - **Detailed Timing Extraction:** Converts MIDI ticks to seconds and calculates bar/beat positions.
 - **Audio Feature Extraction:** Generates mel-spectrograms for both individual instrument groups and final mix cues.
 - **MIDI Event Parsing:** Captures note events, control changes (with thinning of redundant events), and program changes.
-- **OpenAI Integration:** Uses gpt-4o for matching MIDI track names to audio file groups and for instrument categorization.
+- **OpenAI Integration:** Uses gpt-4oo for matching MIDI track names to audio file groups and for instrument categorization.
 - **Progress Visualization:** Displays detailed progress bars for the overall process and for individual processing steps.
 - **Database Integration:** Uses SQLAlchemy to store all processed data into a relational database (supports both local SQLite and external PostgreSQL).
 - **Default Project Creation:** If no project ID is provided, the tool creates a default project.
@@ -68,7 +68,7 @@ The Audio-MIDI Preprocessing Tool processes cue directories (each containing a `
 - **Python 3.8+**
 - **Mido:** For MIDI file parsing.
 - **Librosa & NumPy:** For audio processing and mel-spectrogram extraction.
-- **OpenAI Python API:** For gpt-4o-powered matching and categorization.
+- **OpenAI Python API:** For gpt-4oo-powered matching and categorization.
 - **TheFuzz:** For fuzzy string matching.
 - **SQLAlchemy & Psycopg2:** For ORM-based database operations.
 - **tqdm:** For progress bar visualization.

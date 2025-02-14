@@ -105,7 +105,7 @@ INSTRUMENT_CATEGORIES = [
     "Piano", "Keys", "Bells", "Harp", "Synth Pulse", "Synth Pad", "Synth Bass",
     "Low Percussion", "Mid Percussion", "High Percussion", "Drums", "Orch Percussion",
     "Bass", "Double Bass", "FX", "Choir", "Solo Vocals", "Mallets", "Plucked",
-    "Sub Hits", "Guitar FX", "Orch FX", "Ticker"
+    "Sub Hits", "Guitar FX", "Orch FX", "Ticker", "Extra"
 ]
 
 MARKER_KEYWORDS = ["NOTES", "CONDUCTOR", "ORCHESTRATOR", "MARKER", "MONITOR", "MIDI"]
@@ -116,21 +116,21 @@ CHANNEL_ORDER = {
 
 # Updated instrument abbreviations dictionary
 INSTRUMENT_ABBREVIATIONS = {
-    "VCS": "Violoncello", "VLN": "Violin", "VLA": "Viola", "CBS": "Contra Bass",
-    "HARP": "Harp", "HPS": "Harps",
-    "BASS": "Bass", "PERC": "Percussion", "TPT": "Trumpet",
-    "GONG": "High Percussion", "METALS": "High Percussion",
-    "TBN": "Trombone", "FHNS": "French Horn", "FL": "Flute", "OB": "Oboe", "CL": "Clarinet",
-    "BSN": "Bassoon", "SAX": "Saxophone", "GTR": "Guitar",
-    "SYN": "Synth", "FX": "Effects", "PAD": "Synth Pad",
+    "STG": "Strings", "VCS": "Strings", "VLN": "Strings", "VLA": "Strings", "CBS": "Strings",
+    "HARP": "Harp", "HPS": "Harp", "BASS TRB": "Brass", "TRB": "Brass", "TBNS": "Brass",
+    "BASS": "Bass", "PERC": "Percussion", "TPT": "Brass", "FHN": "Brass",
+    "GONG": "High Percussion", "METALS": "High Percussion", "BASS DRUM": "Low Percussion",
+    "TBN": "Brass", "FHNS": "Brass", "FL": "Woodwinds", "OB": "Woodwinds", "CL": "Woodwinds",
+    "BSN": "Woodwinds", "SAX": "Woodwinds", "GTR": "Guitar", "BASSOON": "Woodwinds",
+    "SYN": "Synth", "FX": "Effects", "PAD": "Synth Pad", "DRONE": "Synth Pad",
     "ORG": "Keys", "UKE": "Plucked", "MARIMBA": "Mallets", "HORN": "Brass",
-    "PNO": "Piano", "HITS": "FX", 
-    "BELL": "Bells", "CHOIR": "Choir", "PLUCK": "Plucked",
-    "VOX": "Solo Vocals", "MALLET": "Mallet Percussion",
+    "PNO": "Piano", "HITS": "Effects", "PEDRO": "Woodwinds", "MARTIN": "Electric Guitar",
+    "BELL": "Bells", "CHOIR": "Choir", "PLUCK": "Plucked", "BASS CLARINET": "Woodwinds",
+    "VOX": "Solo Vocals", "MALLET": "Mallets", "BOOM": "Effects",
     "TAIKO": "Low Percussion", "TKO": "Low Percussion",
     "TIMP": "Orch Percussion", "TIMPANI": "Orch Percussion",
-    "SNR": "Mid Percussion",
-    "CYM": "High Percussion"
+    "SNR": "Mid Percussion", "Duduk": "Woodwinds", "SHAKU": "Woodwinds",
+    "CYM": "High Percussion", "SHAKER": "High Percussion", "AMB": "Synth Pad", "AMBIENT": "Synth_Pad"
 }
 
 CATEGORY_OVERRIDES = {
@@ -164,7 +164,6 @@ def find_cue_directories(base_dir):
     return cue_dirs
 
 # --- New functions to trim common parts of audio group names ---
-
 def longest_common_prefix(tokens_list):
     """Given a list of token lists, return the list of tokens in the longest common prefix."""
     if not tokens_list:
@@ -210,7 +209,45 @@ def trim_audio_group_names(names):
     mapping = {}
     for original, t in zip(names, trimmed_list):
         mapping[original] = t if t != "" else original
+    logger.debug(f"Trimmed audio group names mapping: {mapping}")
     return mapping
+
+# New helper function for determining instrument category.
+def get_instrument_category(expanded_name):
+    """
+    Determine the instrument category from an expanded name.
+    First, check for explicit keywords. If 'CONTRA BASS' appears anywhere,
+    return 'Strings'. Then check if any known category appears as a substring.
+    Otherwise, fall back to fuzzy matching.
+    """
+    expanded_upper = expanded_name.upper()
+    
+    # Explicit check: if the name indicates 'CONTRA BASS', use 'Strings'
+    if "CONTRA BASS" in expanded_upper:
+        return "Strings"
+    
+    # Check if any category name is directly contained in the expanded name.
+    for category in INSTRUMENT_CATEGORIES:
+        if category.upper() in expanded_upper:
+            return category
+    
+    # Fallback to fuzzy matching
+    best_match, score = fuzz_process.extractOne(expanded_name, INSTRUMENT_CATEGORIES)
+    if not best_match or score < 70:
+        return "Strings"
+    return best_match
+
+def expand_instrument_abbrev(name):
+    cleaned = clean_name(name)
+    normalized = cleaned.upper()
+    # Process longer abbreviations first to avoid partial matches
+    for abbr, full in sorted(INSTRUMENT_ABBREVIATIONS.items(), key=lambda x: -len(x[0])):
+        pattern = r'\b' + re.escape(abbr) + r'\b'
+        normalized = re.sub(pattern, full.upper(), normalized)
+    for k, v in CATEGORY_OVERRIDES.items():
+        if normalized == k.upper():
+            return v
+    return normalized
 
 # ---------------------------------------------------------------------
 # Database imports
@@ -270,17 +307,25 @@ def get_audio_file_groups(audio_dir, keyword_filter=None):
         sorted_groups[canonical] = sorted_files
     return sorted_groups
 
+# **ADDED: A simple normalization helper (safety limiter)**
+def normalize_audio(stereo_audio):
+    max_val = np.max(np.abs(stereo_audio))
+    if max_val > 1.0:
+        return stereo_audio / max_val
+    return stereo_audio
+
 def downmix_interleaved(y):
     if y.shape[0] < 2:
         return y
     if y.shape[0] == 6:
         left = y[0] + 0.707 * y[2] + 0.5 * y[4] + 0.3548 * y[3]
         right = y[1] + 0.707 * y[2] + 0.5 * y[5] + 0.3548 * y[3]
-        return np.stack([left, right], axis=0)
+        stereo = np.stack([left, right], axis=0)
     else:
         left = np.mean(y[: y.shape[0] // 2], axis=0)
         right = np.mean(y[y.shape[0] // 2 :], axis=0)
-        return np.stack([left, right], axis=0)
+        stereo = np.stack([left, right], axis=0)
+    return normalize_audio(stereo)  # **NORMALIZE**
 
 def downmix_from_separate(file_tuples, sample_rate):
     if len(file_tuples) == 2:
@@ -289,7 +334,8 @@ def downmix_from_separate(file_tuples, sample_rate):
             left, _ = librosa.load(file_tuples[0][0], sr=sample_rate, mono=True)
             right, _ = librosa.load(file_tuples[1][0], sr=sample_rate, mono=True)
             min_len = min(len(left), len(right))
-            return np.stack([left[:min_len], right[:min_len]], axis=0)
+            stereo = np.stack([left[:min_len], right[:min_len]], axis=0)
+            return normalize_audio(stereo)  # **NORMALIZE**
     gains = {
         "L": (1.0, 0.0),
         "R": (0.0, 1.0),
@@ -320,7 +366,8 @@ def downmix_from_separate(file_tuples, sample_rate):
         else:
             left += 0.5 * sig
             right += 0.5 * sig
-    return np.stack([left, right], axis=0)
+    stereo = np.stack([left, right], axis=0)
+    return normalize_audio(stereo)  # **NORMALIZE**
 
 def combine_audio_group(file_list, sample_rate):
     if not file_list:
@@ -329,7 +376,8 @@ def combine_audio_group(file_list, sample_rate):
         if len(file_list) == 1:
             mono_path = file_list[0][0]
             y, _ = librosa.load(mono_path, sr=sample_rate, mono=True)
-            return np.stack([y, y], axis=0)
+            stereo = np.stack([y, y], axis=0)
+            return normalize_audio(stereo)
         elif len(file_list) == 2:
             label0 = file_list[0][2]
             label1 = file_list[1][2]
@@ -337,7 +385,8 @@ def combine_audio_group(file_list, sample_rate):
                 left, _ = librosa.load(file_list[0][0], sr=sample_rate, mono=True)
                 right, _ = librosa.load(file_list[1][0], sr=sample_rate, mono=True)
                 min_len = min(len(left), len(right))
-                return np.stack([left[:min_len], right[:min_len]], axis=0)
+                stereo = np.stack([left[:min_len], right[:min_len]], axis=0)
+                return normalize_audio(stereo)
             else:
                 return downmix_from_separate(file_list, sample_rate)
         else:
@@ -354,44 +403,54 @@ def combine_audio_group(file_list, sample_rate):
                 logger.warning(f"Unexpected # of channels ({y.shape[0]}) for {path}, downmixing by averaging.")
                 left = np.mean(y[: y.shape[0] // 2], axis=0)
                 right = np.mean(y[y.shape[0] // 2 :], axis=0)
-                return np.stack([left, right], axis=0)
+                stereo = np.stack([left, right], axis=0)
+                return normalize_audio(stereo)
         return y
 
+# **MODIFIED: Updated encode_audio_features to process the full audio by chunking**
 def encode_audio_features(y, sr):
     """
-    Encode a stereo numpy array using AudioCraft EnCodec:
+    Encode a stereo numpy array using AudioCraft EnCodec over the full audio:
       1) Convert to a torch tensor.
       2) Resample to 48k and adjust channels.
-      3) Pad or truncate to the model's expected chunk length.
-      4) Encode and flatten the output.
+      3) Chunk the audio into segments of the model's expected chunk length.
+      4) Encode each chunk and concatenate the latent codes.
+      5) Flatten and return the latent codes.
     """
     if y is None:
         return None
     audio_tensor = torch.tensor(y, dtype=torch.float32)
+    # Ensure shape is [batch, channels, samples]
     if audio_tensor.ndim == 2:
         audio_tensor = audio_tensor.unsqueeze(0)
-    audio_tensor = convert_audio(
-        audio_tensor,
-        src_sr=sr,
-        dst_sr=encodec_model.sample_rate,
-        dst_channels=encodec_model.channels
-    )
+    audio_tensor = convert_audio(audio_tensor,
+                                 src_sr=sr,
+                                 dst_sr=encodec_model.sample_rate,
+                                 dst_channels=encodec_model.channels)
     if hasattr(encodec_model, "model") and hasattr(encodec_model.model, "config"):
         config = encodec_model.model.config
         chunk_length = config.chunk_length
     else:
         chunk_length = 768
-    L = audio_tensor.shape[-1]
-    if L < chunk_length:
-        pad_needed = chunk_length - L
-        logger.debug(f"Padding audio from {L} to {chunk_length} samples.")
+    total_length = audio_tensor.shape[-1]
+    num_chunks = (total_length + chunk_length - 1) // chunk_length  # ceiling division
+    padded_length = num_chunks * chunk_length
+    if total_length < padded_length:
+        pad_needed = padded_length - total_length
+        logger.debug(f"Padding audio from {total_length} to {padded_length} samples for full encoding.")
         audio_tensor = F.pad(audio_tensor, (0, pad_needed))
-    elif L > chunk_length:
-        logger.debug(f"Truncating audio from {L} to {chunk_length} samples.")
-        audio_tensor = audio_tensor[..., :chunk_length]
+    # Reshape to [num_chunks, channels, chunk_length]
+    channels = audio_tensor.shape[1]
+    audio_tensor = audio_tensor.reshape(num_chunks, channels, chunk_length)
     with torch.no_grad():
-        codes, scale = encodec_model.encode(audio_tensor)
-    codes_flat = codes[0].flatten()
+        codes, scale = encodec_model.encode(audio_tensor)  
+        # codes shape: [num_chunks, num_quantizers, n_frames_per_chunk]
+    num_quantizers = codes.shape[1]
+    n_frames_per_chunk = codes.shape[2]
+    # Concatenate along time: reshape to [num_quantizers, num_chunks * n_frames_per_chunk]
+    codes_cat = codes.transpose(0,1).reshape(num_quantizers, num_chunks * n_frames_per_chunk)
+    # Flatten to 1D for serialization
+    codes_flat = codes_cat.flatten()
     return codes_flat.cpu().numpy()
 
 def serialize_feature_array(feature_array):
@@ -482,16 +541,6 @@ def extract_midi_track_names(midi_path):
         result.append((i, track_name))
     return result
 
-def expand_instrument_abbrev(name):
-    cleaned = clean_name(name)
-    normalized = cleaned.upper()
-    for abbr, full in INSTRUMENT_ABBREVIATIONS.items():
-        normalized = normalized.replace(abbr, full.upper())
-    for k, v in CATEGORY_OVERRIDES.items():
-        if normalized == k.upper():
-            return v
-    return normalized
-
 # ---------------------------------------------------------------------
 # BatchManager for Chat (OpenAI Batch API) – Updated to use tiktoken
 # ---------------------------------------------------------------------
@@ -516,7 +565,6 @@ class BatchManager:
             # Sum tokens over all messages in the request
             for msg in req["body"]["messages"]:
                 total += self._count_tokens(msg["content"])
-            # Optionally, include any other parts (like max_tokens) if desired
         return total
 
     def queue_chat_request(self, user_prompt, system_prompt, custom_id):
@@ -594,7 +642,7 @@ class BatchManager:
             status_obj = client.batches.retrieve(batch_id)
             status = status_obj.status
             if status == "completed":
-                logger.info(f"Batch {batch_id} complete. Waiting an extra 30 seconds before proceeding for safety...")
+                logger.info(f"Batch {batch_id} complete. Waiting an extra 10 seconds before proceeding for safety...")
                 time.sleep(10)
                 break
             elif status in ["failed", "expired"]:
@@ -652,14 +700,20 @@ class BatchManager:
             # Count tokens over the messages in this request
             estimated_tokens = sum(self._count_tokens(msg["content"]) for msg in body["messages"])
             if len(current_batch) >= max_requests_per_batch or (current_token_count + estimated_tokens) > max_tokens_per_batch:
-                results.update(self._process_batch(current_batch))
+                try:
+                    results.update(self._process_batch(current_batch))
+                except openai.NotFoundError as e:
+                    logger.warning(f"Batch not found, skipping this batch: {e}")
                 current_batch = []
                 current_token_count = 0
             current_batch.append(req)
             current_token_count += estimated_tokens
 
         if current_batch:
-            results.update(self._process_batch(current_batch))
+            try:
+                results.update(self._process_batch(current_batch))
+            except openai.NotFoundError as e:
+                logger.warning(f"Batch not found, skipping this batch: {e}")
         self.requests = []
         return results
 
@@ -686,7 +740,7 @@ class BatchManager:
         self.requests = []
         return results
 
-# Global BatchManagers and pending cue data storage
+# Global BatchManagers and pending cue data storage (still using "gpt-4o")
 global_batch_manager_match = BatchManager(model="gpt-4o")
 global_batch_manager_common = BatchManager(model="gpt-4o")
 pending_cue_data = {}
@@ -738,6 +792,8 @@ def process_cue(cue_dir, sample_rate, project_id):
     trim_mapping = trim_audio_group_names(available_groups_original)
     # available_groups_trimmed is the list of unique (trimmed) names.
     available_groups_trimmed = list(trim_mapping.values())
+    logger.info(f"Original audio groups: {available_groups_original}")
+    logger.info(f"Trimmed audio groups: {available_groups_trimmed}")
 
     composite_audio = {}
     print("Combining/downmix audio in", pt_dir)
@@ -758,7 +814,7 @@ def process_cue(cue_dir, sample_rate, project_id):
         cue_group_id=cue_group_id,
         project_id=project_id
     )
-    # Check final mix
+    # Check final mix: audio groups matching "6mx" or "ref" should be processed here.
     final_mix_groups = get_audio_file_groups(
         pt_dir,
         keyword_filter=lambda c: "6mx" in c.lower() or "ref" in c.lower()
@@ -782,14 +838,16 @@ def process_cue(cue_dir, sample_rate, project_id):
     else:
         print("No final mix found in", pt_dir)
     audio_file_records = {}
+    # Process each audio group except those that should be only in final mix.
     for canonical, file_tuples in audio_groups.items():
+        # Skip groups that match "ref" or "6mx" since they belong only in final mix.
+        if "ref" in canonical.lower() or "6mx" in canonical.lower():
+            continue
         rep = file_tuples[0] if isinstance(file_tuples[0], tuple) else (file_tuples[0], None, None)
         full_path = os.path.join(pt_dir, os.path.basename(rep[0]))
         name_expanded = expand_instrument_abbrev(canonical)
-        best_match, score = fuzz_process.extractOne(name_expanded, INSTRUMENT_CATEGORIES)
-        if not best_match:
-            best_match = "Strings"
-        audio_cat = best_match
+        # Use new helper to determine audio category.
+        audio_cat = get_instrument_category(name_expanded)
         exist_aud = session.query(AudioFile).filter_by(file_path=full_path).first()
         if exist_aud:
             print(f"Audio file {full_path} in DB, skipping.")
@@ -990,7 +1048,16 @@ def finalize_phase_4():
             assigned_audio_id = None
             if chosen_group in audio_file_records:
                 assigned_audio_id = audio_file_records[chosen_group]
-            final_cat = group_common_map.get(chosen_trimmed, "Strings")
+            # If an audio file exists for this group, use its category.
+            if assigned_audio_id is not None:
+                audio_file_obj = session.query(AudioFile).filter_by(id=assigned_audio_id).first()
+                if audio_file_obj:
+                    final_cat = audio_file_obj.instrument_category
+                else:
+                    final_cat = group_common_map.get(chosen_trimmed, "Strings")
+            else:
+                final_cat = group_common_map.get(chosen_trimmed, "Strings")
+            # Optionally, update the audio file to ensure consistency.
             if assigned_audio_id is not None:
                 audio_file_obj = session.query(AudioFile).filter_by(id=assigned_audio_id).first()
                 if audio_file_obj:
@@ -1028,7 +1095,11 @@ def main():
         sys.exit(0)
     print(f"Found {len(cue_dirs)} cue directories. Beginning Phase 1 processing...")
     for cue in tqdm(cue_dirs, desc="Processing Cues"):
-        process_cue(cue, sample_rate, project_id)
+        try:
+            process_cue(cue, sample_rate, project_id)
+        except Exception as e:
+            logger.error(f"Error processing cue {cue}: {e}")
+            continue
     print("Phase 1 complete. All cues processed.")
     finalize_phase_2_3()
     finalize_phase_4()
