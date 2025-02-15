@@ -62,6 +62,7 @@ class AudioFile(Base):
     instrument_category = Column(String, nullable=True)
     cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    chunk_size = Column(Integer, nullable=True)  # NEW: store the chunk size used
 
     project = relationship("Project", back_populates="audio_files")
     cue_group = relationship("CueGroup", back_populates="audio_files")
@@ -87,6 +88,7 @@ class FinalMix(Base):
     feature_data = Column(LargeBinary)    # Stored as binary (npy format)
     cue_group_id = Column(Integer, ForeignKey("cue_groups.id"), nullable=True)
     project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+    chunk_size = Column(Integer, nullable=True)  # NEW: store the chunk size used
 
     project = relationship("Project", back_populates="final_mixes")
     cue_group = relationship("CueGroup", back_populates="final_mixes")
@@ -182,13 +184,14 @@ def insert_midi_file(file_path, tempo_map, time_signature_map, ticks_per_beat, c
     session.commit()
     return record
 
-def insert_audio_file(file_path, canonical_name, instrument_category, cue_group_id=None, project_id=None):
+def insert_audio_file(file_path, canonical_name, instrument_category, cue_group_id=None, project_id=None, chunk_size=None):
     record = AudioFile(
         file_path=file_path,
         canonical_name=canonical_name,
         instrument_category=instrument_category,
         cue_group_id=cue_group_id,
-        project_id=project_id
+        project_id=project_id,
+        chunk_size=chunk_size
     )
     session.add(record)
     session.commit()
@@ -204,14 +207,15 @@ def insert_audio_feature(audio_file_id, feature_type, feature_data):
     session.commit()
     return record
 
-def insert_final_mix(midi_file_id, file_path, feature_type, feature_data, cue_group_id=None, project_id=None):
+def insert_final_mix(midi_file_id, file_path, feature_type, feature_data, cue_group_id=None, project_id=None, chunk_size=None):
     record = FinalMix(
         midi_file_id=midi_file_id,
         file_path=file_path,
         feature_type=feature_type,
         feature_data=feature_data,
         cue_group_id=cue_group_id,
-        project_id=project_id
+        project_id=project_id,
+        chunk_size=chunk_size
     )
     session.add(record)
     session.commit()
